@@ -1,0 +1,128 @@
+// StretchBridge.swift
+//
+// Thin Swift wrapper around the C API in AkaizerCore/include/AkaizerCore.h.
+// Deliberately thin: the C types (AkzMachine, AkzEngine, AkzStretchMode,
+// AkzStretchParams) are used directly rather than re-declared as parallel
+// Swift enums, so the machine profile table in MachineProfile.cpp stays
+// the single source of truth (plan: "reuse existing").
+
+import AkaizerCore
+
+/// Owns one AkzStretchEngine handle -- the synchronous, offline engine.
+/// NOT safe to drive from an audio render thread: process() recomputes
+/// (allocating) on whatever thread calls it when params/source changed.
+/// Used for the app's offline Process/Save path. For live audition from
+/// an AVAudioSourceNode render callback, use RealtimePlayer below instead.
+public final class StretchProcessor {
+    private var engine: OpaquePointer?
+
+    public init(sampleRateHz: Double) {
+        engine = akz_stretch_engine_create(sampleRateHz)
+    }
+
+    deinit {
+        akz_stretch_engine_destroy(engine)
+    }
+
+    public func reset() {
+        akz_stretch_engine_reset(engine)
+    }
+
+    public func setParams(_ params: AkzStretchParams) {
+        var p = params
+        akz_stretch_engine_set_params(engine, &p)
+    }
+
+    public func setSource(_ samples: [Float]) {
+        akz_stretch_engine_set_source(engine, samples, samples.count)
+    }
+
+    public var outputLength: Int {
+        Int(akz_stretch_engine_output_length(engine))
+    }
+
+    /// Renders the entire output in one call -- fine for the offline
+    /// milestone this is currently used for. See StretchEngine.h's
+    /// stage-4 TODO for why this isn't yet how real-time audition will
+    /// pull audio.
+    public func renderAll() -> [Float] {
+        let len = outputLength
+        guard len > 0 else { return [] }
+        var out = [Float](repeating: 0, count: len)
+        let written = out.withUnsafeMutableBufferPointer { buf in
+            akz_stretch_engine_process(engine, buf.baseAddress, len)
+        }
+        if written < len {
+            out.removeLast(len - written)
+        }
+        return out
+    }
+
+    public static func defaultParams(machine: AkzMachine) -> AkzStretchParams {
+        var params = AkzStretchParams(
+            machine: machine, engine: AkzEngine_Classic, mode: AkzStretchMode_Cyclic,
+            timeFactorPercent: 100, cycleLengthSamples: 1000, quality: 10, width: 10,
+            transposeSemitones: 0, filterCutoff01: 1, filterResonance01: 0
+        )
+        akz_stretch_params_default(machine, &params)
+        return params
+    }
+
+    public static func profile(for machine: AkzMachine) -> AkzMachineProfile {
+        akz_machine_profile(machine).pointee
+    }
+
+    /// All machines in declaration order, for building a picker.
+    public static let allMachines: [AkzMachine] = [
+        AkzMachine_S900, AkzMachine_S950, AkzMachine_S1000,
+        AkzMachine_S2000, AkzMachine_S3000, AkzMachine_S3200,
+    ]
+}
+
+/// Owns one AkzRealtimePlayer -- the render-thread-safe player used for
+/// live audition. setSource()/setParams() are main-thread/UI-thread
+/// calls (they may allocate); pull() is safe to call from a CoreAudio
+/// render callback (see AkaizerCore.h's "Real-time audition player"
+/// section for the full contract).
+public final class RealtimePlayer {
+    private var player: OpaquePointer?
+
+    public init(sampleRateHz: Double) {
+        player = akz_realtime_player_create(sampleRateHz)
+    }
+
+    deinit {
+        akz_realtime_player_destroy(player)
+    }
+
+    /// Main-thread only.
+    public func setSource(_ samples: [Float]) {
+        akz_realtime_player_set_source(player, samples, samples.count)
+    }
+
+    /// Main-thread only.
+    public func setParams(_ params: AkzStretchParams) {
+        var p = params
+        akz_realtime_player_set_params(player, &p)
+    }
+
+    /// Render-thread safe. Fills `frameCount` frames (looping the most
+    /// recently published render, or silence before the first one).
+    public func pull(frameCount: Int, into buffer: UnsafeMutablePointer<Float>) {
+        akz_realtime_player_pull(player, buffer, frameCount)
+    }
+
+    /// Render-thread safe, non-blocking.
+    public var isReady: Bool {
+        akz_realtime_player_is_ready(player) != 0
+    }
+}
+
+public extension AkzMachineProfile {
+    /// `name` is a `const char*` into static C storage -- always valid,
+    /// never needs freeing (see AkaizerCore.h), so this is a safe, cheap
+    /// conversion.
+    var displayName: String {
+        name != nil ? String(cString: name) : "?"
+    }
+}

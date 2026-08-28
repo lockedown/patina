@@ -1,0 +1,47 @@
+# Build directories
+build/
+build_*/
+cmake-build-*/
+DerivedData/
+.build/
+.swiftpm/
+dist/
+
+# IDE files
+.idea/
+.vscode/
+*.user
+*.suo
+xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# macOS specific
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables / app bundles
+*.exe
+*.out
+*.app
