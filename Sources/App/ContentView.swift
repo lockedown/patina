@@ -86,6 +86,14 @@ struct ContentView: View {
         StretchProcessor.profile(for: selectedMachine)
     }
 
+    /// The current machine's documented defaults -- used as each knob's
+    /// double-click reset target, so "reset" always means "this
+    /// machine's real default," not a hardcoded number that drifts once
+    /// another machine is selected.
+    private var _defaultParams: AkzStretchParams {
+        StretchProcessor.defaultParams(machine: selectedMachine)
+    }
+
     private var _stretchIsSupported: Bool {
         machineProfile.supportsTimeStretch != 0
     }
@@ -261,7 +269,15 @@ struct ContentView: View {
     }
 
     private var _mainContent: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        // A ScrollView backstop, not just a fixed-size VStack: the
+        // number of visible knobs/rows changes with machine and mode
+        // (Intelligent adds Quality+Width, Resonance appears/disappears,
+        // the waveform only shows once a file's loaded), so the content
+        // height isn't fixed the way the window's minHeight is. Without
+        // this, a tall combination pushes Process/Play/Stop/Save below
+        // the window's bottom edge instead of just scrolling to them.
+        ScrollView(.vertical) {
+            VStack(alignment: .leading, spacing: 16) {
             HStack {
                 Button("Open WAV/AIFF…", action: openFile)
                 Button("Save Unchanged Copy…", action: saveCopy)
@@ -340,85 +356,140 @@ struct ContentView: View {
                     }
                     .pickerStyle(.segmented)
 
-                    // Transpose is a basic sampler feature every one of
-                    // these machines has (unlike time-stretch, which the
-                    // S900 lacks -- plan section 3.1), so it's shown
-                    // unconditionally rather than gated on
-                    // _stretchIsSupported. Varispeed: pitch and duration
-                    // move together, matching the real hardware -- see
-                    // Interpolator.h.
-                    _sliderRow(
-                        "Transpose", value: $transposeSemitones,
-                        range: -36...36,
-                        format: "%.0f st"
-                    )
-
-                    // Filter (build order stage 6) applies regardless of
-                    // whether the machine supports time-stretch -- every
-                    // one of these machines has SOME VCF (plan section
-                    // 3.1), so cutoff is shown unconditionally. Resonance
-                    // only does anything on S2000/S3000/S3200 (plan
-                    // section 3.2 item 2 -- the S2000 correction) so it's
-                    // hidden rather than shown-but-inert elsewhere.
-                    _sliderRow(
-                        "Cutoff", value: $filterCutoff,
-                        range: 0...1,
-                        format: "%.2f"
-                    )
-                    if _filterHasResonance {
-                        _sliderRow(
-                            "Resonance", value: $filterResonance,
-                            range: 0...1,
-                            format: "%.2f"
-                        )
+                    if _stretchIsSupported && _hasModeSwitch {
+                        Picker("Mode", selection: $selectedMode) {
+                            Text("Cyclic").tag(AkzStretchMode_Cyclic)
+                            Text("Intelligent").tag(AkzStretchMode_Intelligent)
+                        }
+                        .pickerStyle(.segmented)
                     }
 
-                    if _stretchIsSupported {
-                        _sliderRow(
-                            "Stretch", value: $stretchPercent,
-                            range: 25...max(25.0, Double(machineProfile.maxStretchPercent)),
-                            format: "%.0f%%"
-                        )
+                    // One horizontal row for every knob currently
+                    // relevant -- a real Akai rack panel is one strip of
+                    // pots, not a stack of separate control clusters, and
+                    // stacking rows here was pushing Process/Play/Stop
+                    // below the bottom of the window on some machine/mode
+                    // combinations. ScrollView on the whole pane (below)
+                    // is the backstop; a single flat row is the fix that
+                    // actually keeps the common case short.
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(alignment: .top, spacing: 20) {
+                            // Transpose is a basic sampler feature every
+                            // one of these machines has (unlike
+                            // time-stretch, which the S900 lacks -- plan
+                            // section 3.1), so it's shown unconditionally
+                            // rather than gated on _stretchIsSupported.
+                            // Varispeed: pitch and duration move
+                            // together, matching the real hardware -- see
+                            // Interpolator.h.
+                            _knobCell(
+                                "Transpose", value: $transposeSemitones,
+                                range: -36...36, taper: .linear, step: 1,
+                                defaultValue: Double(_defaultParams.transposeSemitones),
+                                format: "%.0f st"
+                            )
 
-                        if _hasModeSwitch {
-                            Picker("Mode", selection: $selectedMode) {
-                                Text("Cyclic").tag(AkzStretchMode_Cyclic)
-                                Text("Intelligent").tag(AkzStretchMode_Intelligent)
+                            // Filter (build order stage 6) applies
+                            // regardless of whether the machine supports
+                            // time-stretch -- every one of these machines
+                            // has SOME VCF (plan section 3.1), so cutoff
+                            // is shown unconditionally. Cutoff's own 0..1
+                            // knob stays linear even though it feels
+                            // logarithmic in use -- FilterModel already
+                            // bends it to 20 Hz..Nyquist one layer down,
+                            // so a log taper here would double-bend the
+                            // same curve.
+                            _knobCell(
+                                "Cutoff", value: $filterCutoff,
+                                range: 0...1, taper: .linear, step: nil,
+                                defaultValue: Double(_defaultParams.filterCutoff01),
+                                format: "%.2f"
+                            )
+
+                            // Resonance only does anything on
+                            // S2000/S3000/S3200 (plan section 3.2 item 2
+                            // -- the S2000 correction) so it's hidden
+                            // rather than shown-but-inert elsewhere.
+                            if _filterHasResonance {
+                                _knobCell(
+                                    "Resonance", value: $filterResonance,
+                                    range: 0...1, taper: .linear, step: nil,
+                                    defaultValue: Double(_defaultParams.filterResonance01),
+                                    format: "%.2f"
+                                )
                             }
-                            .pickerStyle(.segmented)
-                        }
 
-                        // Cycle length only means anything in CYCLIC;
-                        // quality/width only in INTELLIGENT (plan "2.2",
-                        // and each field's own doc comment in
-                        // AkaizerCore.h) -- shown accordingly rather than
-                        // all-visible-but-some-inert.
-                        if _isIntelligentMode {
-                            _sliderRow(
-                                "Quality", value: $quality,
-                                range: 0...99,
-                                format: "%.0f"
-                            )
-                            _sliderRow(
-                                "Width", value: $width,
-                                range: 0...99,
-                                format: "%.0f"
-                            )
-                        } else {
-                            _sliderRow(
-                                "Cycle", value: $cycleLength,
-                                range: 20...2000,
-                                format: "%.0f smp"
-                            )
+                            if _stretchIsSupported {
+                                // Stretch spans 25..2000% (25..999 on the
+                                // S950) -- close to two orders of
+                                // magnitude, with the musically useful
+                                // region bunched near 100%. A logarithmic
+                                // taper gives equal knob rotation to
+                                // equal *ratio* change (e.g. 50%->100%
+                                // feels like the same twist as
+                                // 100%->200%), matching how a
+                                // time-stretch amount is actually heard
+                                // -- a linear taper would crowd
+                                // everything below 200% into a sliver of
+                                // the knob's travel.
+                                _knobCell(
+                                    "Stretch", value: $stretchPercent,
+                                    range: 25...max(25.0, Double(machineProfile.maxStretchPercent)),
+                                    taper: .logarithmic, step: 1,
+                                    defaultValue: Double(_defaultParams.timeFactorPercent),
+                                    format: "%.0f%%"
+                                )
+
+                                // Cycle length only means anything in
+                                // CYCLIC; quality/width only in
+                                // INTELLIGENT (plan "2.2", and each
+                                // field's own doc comment in
+                                // AkaizerCore.h) -- shown accordingly
+                                // rather than all-visible-but-some-inert.
+                                if _isIntelligentMode {
+                                    _knobCell(
+                                        "Quality", value: $quality,
+                                        range: 0...99, taper: .linear, step: 1,
+                                        defaultValue: Double(_defaultParams.quality),
+                                        format: "%.0f"
+                                    )
+                                    _knobCell(
+                                        "Width", value: $width,
+                                        range: 0...99, taper: .linear, step: 1,
+                                        defaultValue: Double(_defaultParams.width),
+                                        format: "%.0f"
+                                    )
+                                } else {
+                                    // 20..2000 samples is the same
+                                    // span-of-two-orders-of-magnitude
+                                    // case as Stretch, for the same
+                                    // reason: cycle length is felt/heard
+                                    // as a ratio (an octave of grain
+                                    // length), not a linear sample count,
+                                    // so it gets the same log taper.
+                                    _knobCell(
+                                        "Cycle", value: $cycleLength,
+                                        range: 20...2000, taper: .logarithmic, step: 1,
+                                        defaultValue: Double(_defaultParams.cycleLengthSamples),
+                                        format: "%.0f smp"
+                                    )
+                                }
+                            }
+
+                            Spacer(minLength: 0)
                         }
-                    } else {
+                        .padding(.vertical, 2)
+                    }
+
+                    if !_stretchIsSupported {
                         // S900 predates the S950's time-stretch feature
                         // entirely (plan section 3.1) -- maxStretchPercent
                         // is 0 for it, which would make 25...0 an invalid
-                        // range and crash the Slider. Rather than lean on
-                        // the `max(25.0, ...)` clamp above alone as the
-                        // only thing standing between this and a crash,
-                        // don't offer stretch controls for a machine that
+                        // range and crash a Slider (and a knob's own
+                        // range-driven maths). Rather than lean on the
+                        // `max(25.0, ...)` clamp above alone as the only
+                        // thing standing between this and a crash, don't
+                        // offer stretch knobs for a machine that
                         // structurally doesn't have the feature.
                         Text("\(machineProfile.displayName) has no time-stretch capability (added in the S950).")
                             .font(.callout)
@@ -462,24 +533,32 @@ struct ContentView: View {
 
             Text(statusMessage)
                 .font(.callout)
-
-            Spacer()
+            }
+            .padding(20)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .padding(20)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
-    private func _sliderRow(_ label: String, value: Binding<Double>, range: ClosedRange<Double>, format: String) -> some View {
-        HStack {
+    /// One rack-panel knob: label above, RotaryKnobView, formatted value
+    /// below -- doubling as the value readout the LCD's own summary rows
+    /// (_lcdRows) still cover, but readable at a glance without hunting
+    /// for the field in a wall of text. Double-click/tap resets to
+    /// defaultValue, mirroring a hardware pot's printed centre mark.
+    private func _knobCell(
+        _ label: String, value: Binding<Double>, range: ClosedRange<Double>,
+        taper: KnobTaper, step: Double?, defaultValue: Double?, format: String
+    ) -> some View {
+        VStack(spacing: 4) {
             Text(label)
+                .font(.caption)
                 .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .frame(width: 84, alignment: .leading)
-            Slider(value: value, in: range)
+            RotaryKnobView(value: value, range: range, taper: taper, step: step, defaultValue: defaultValue)
             Text(String(format: format, value.wrappedValue))
-                .font(.system(.body, design: .monospaced))
-                .frame(width: 70, alignment: .trailing)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.primary)
         }
+        .frame(width: 72)
     }
 
     // -- file actions ------------------------------------------------------
