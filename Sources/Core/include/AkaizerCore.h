@@ -227,6 +227,31 @@ size_t akz_realtime_player_pull(AkzRealtimePlayer* player, float* out_frames, si
 // published (pull() will produce real audio rather than silence).
 int akz_realtime_player_is_ready(const AkzRealtimePlayer* player);
 
+// Render-thread safe, non-blocking. Non-zero once a stretch-affecting
+// re-render (Transpose/Stretch/Cycle/Quality/Width/Mode -- anything that
+// can change buffer length) has finished on the worker thread and is
+// waiting to be swapped in via akz_realtime_player_commit_pending().
+// Filter/resonance-only changes never appear here -- they publish
+// immediately, with no commit step, since they can't change length or
+// need cross-channel coordination. See LiveAuditionController.swift's
+// render callback for why this two-step publish exists: with N
+// independent players (one per channel, each with its own worker
+// thread), publishing a length-changing re-render the instant ITS OWN
+// worker finishes lets one channel start playing new audio while a
+// sibling channel is still finishing the SAME change on the OLD audio --
+// heard as artificial stereo width. The caller must check this on every
+// channel and only commit once ALL of them are ready, in the same
+// render-callback invocation, so every channel's read position resets
+// to 0 on the exact same audio frame.
+int akz_realtime_player_has_pending_commit(const AkzRealtimePlayer* player);
+
+// Render-thread safe. Swaps the pending re-render (if any) into the
+// published buffer and resets the read position to 0; a no-op if
+// akz_realtime_player_has_pending_commit() was false. See that
+// function's comment -- callers must gate this on every sibling
+// channel's player also being ready, and commit all of them together.
+void akz_realtime_player_commit_pending(AkzRealtimePlayer* player);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

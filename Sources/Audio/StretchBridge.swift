@@ -116,6 +116,20 @@ public final class RealtimePlayer {
     public var isReady: Bool {
         akz_realtime_player_is_ready(player) != 0
     }
+
+    /// Render-thread safe, non-blocking. See AkaizerCore.h's comment on
+    /// akz_realtime_player_has_pending_commit -- true once a
+    /// stretch-affecting re-render is waiting to be swapped in. Must be
+    /// checked on every channel's player before calling commitPending()
+    /// on any of them; see LiveAuditionController's render callback.
+    public var hasPendingCommit: Bool {
+        akz_realtime_player_has_pending_commit(player) != 0
+    }
+
+    /// Render-thread safe. No-op if hasPendingCommit was false.
+    public func commitPending() {
+        akz_realtime_player_commit_pending(player)
+    }
 }
 
 public extension AkzMachineProfile {

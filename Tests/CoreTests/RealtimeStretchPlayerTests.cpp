@@ -31,9 +31,28 @@ std::vector<float> makeRamp(size_t frameCount) {
     return buf;
 }
 
+// Every render -- including a fresh player's very first one -- is
+// stretch-affecting (there's nothing to reapply a filter onto yet), so
+// it publishes to the PENDING slot, not directly, and needs an explicit
+// commitPending() to become visible to pull()/is_ready(). Real callers
+// gate that commit across every channel (see LiveAuditionController's
+// render callback); a lone test player has no siblings to wait for, so
+// committing the moment it has something pending is the correct
+// single-channel analogue, not a shortcut around the new contract.
 void waitUntilReady(AkzRealtimePlayer* player, int maxMillis = 2000) {
     int waited = 0;
     while (!akz_realtime_player_is_ready(player) && waited < maxMillis) {
+        if (akz_realtime_player_has_pending_commit(player)) {
+            akz_realtime_player_commit_pending(player);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        waited += 2;
+    }
+}
+
+void waitForPendingCommit(AkzRealtimePlayer* player, int maxMillis = 2000) {
+    int waited = 0;
+    while (!akz_realtime_player_has_pending_commit(player) && waited < maxMillis) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
         waited += 2;
     }
@@ -173,30 +192,31 @@ AKZ_TEST(realtime_player_filter_only_change_does_not_reset_read_position) {
     akz_realtime_player_destroy(player);
 }
 
-AKZ_TEST(realtime_player_stretch_affecting_change_resets_read_position_to_zero) {
+AKZ_TEST(realtime_player_stretch_affecting_change_publishes_pending_then_resets_on_commit) {
     // Companion to the filter-only test above: a change that DOES need a
     // full re-render (here, cycleLengthSamples -- stretch-affecting, not
-    // filter-only) must reset the read position to 0.
+    // filter-only) must NOT reset the read position (or become visible
+    // to pull() at all) the moment the background worker finishes --
+    // only once commitPending() is explicitly called.
     //
-    // This used to instead remap the position proportionally into the
-    // new (possibly different-length) buffer, so playback resumed near
-    // the same musical position instead of visibly restarting -- reverted
-    // after a real regression report: "changing the cycle slider makes
-    // [live audition] sound stereo width." LiveAuditionController runs
-    // one independent RealtimeStretchPlayer PER CHANNEL (see
-    // LiveAuditionController.swift), each with its own background worker.
-    // The old position used for the remap is a live, continuously-
-    // advancing value; when the two channels' workers process the SAME
-    // change at different wall-clock moments (ordinary thread scheduling
-    // skew), each reads a DIFFERENT old position -- the channel whose
-    // worker runs later has kept advancing on the old buffer in the
-    // meantime -- so the two channels remap to genuinely different, and
-    // then permanently desynchronised, positions. Resetting to the fixed
-    // constant 0 is immune to this: every channel's worker converges on
-    // the exact same value regardless of when it happens to run. See the
-    // reverted code's comment in RealtimeStretchPlayer.cpp for the full
-    // explanation, and the filter-only test above for why that path
-    // (which never touches the read position at all) was never at risk.
+    // This used to publish and reset-to-0 unconditionally the instant
+    // the worker finished. That was itself a fix for an even earlier bug
+    // (proportional remapping desynchronising channels permanently -- see
+    // git blame), but it carried a subtler bug of its own:
+    // LiveAuditionController runs one independent RealtimeStretchPlayer
+    // PER CHANNEL, each with its own background worker racing the
+    // others. Publishing unilaterally meant whichever channel's worker
+    // finished first would start playing the new buffer from 0 while a
+    // sibling channel -- still finishing the SAME change -- kept playing
+    // the OLD buffer for however long that gap lasted: heard as
+    // artificial stereo width on every stretch-affecting knob (not just
+    // Cycle, and not just once -- continuously, for as long as knob
+    // dragging keeps re-triggering the gap). Deferring the publish to a
+    // PENDING slot until an explicit, externally-gated commitPending()
+    // call is what lets LiveAuditionController's render callback commit
+    // every channel together instead. See
+    // two_independent_players_commit_gated_together_stay_in_sync below
+    // for the direct multi-channel version of this.
     auto source = makeRamp(2000);
     AkzStretchParams params;
     akz_stretch_params_default(AkzMachine_S1000, &params);
@@ -204,6 +224,19 @@ AKZ_TEST(realtime_player_stretch_affecting_change_resets_read_position_to_zero) 
     params.mode = AkzStretchMode_Cyclic;
     params.timeFactorPercent = 100.0f;
     params.cycleLengthSamples = 200; // -> output length 2000 (divides evenly)
+
+    // Reference for the OLD params (cycleLengthSamples == 200), computed
+    // before the change below -- the pipeline (quantize + filter) means
+    // this is close to but not bit-identical to the raw source, so this,
+    // not source itself, is what "still serving the old buffer" has to
+    // match.
+    AkzStretchEngine* oldOffline = akz_stretch_engine_create(44100.0);
+    akz_stretch_engine_set_params(oldOffline, &params);
+    akz_stretch_engine_set_source(oldOffline, source.data(), source.size());
+    size_t oldLen = akz_stretch_engine_output_length(oldOffline);
+    std::vector<float> oldReference(oldLen);
+    akz_stretch_engine_process(oldOffline, oldReference.data(), oldLen);
+    akz_stretch_engine_destroy(oldOffline);
 
     AkzRealtimePlayer* player = akz_realtime_player_create(44100.0);
     akz_realtime_player_set_source(player, source.data(), source.size());
@@ -217,7 +250,15 @@ AKZ_TEST(realtime_player_stretch_affecting_change_resets_read_position_to_zero) 
     // Stretch-affecting change: cycleLengthSamples 200 -> 300.
     params.cycleLengthSamples = 300;
     akz_realtime_player_set_params(player, &params);
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    waitForPendingCommit(player);
+    AKZ_CHECK(akz_realtime_player_has_pending_commit(player));
+
+    // Not committed yet -- pull() must still be serving the OLD buffer,
+    // continuing on from where it left off (position 500), not the new
+    // one and not position 0.
+    float stillOld[1];
+    akz_realtime_player_pull(player, stillOld, 1);
+    AKZ_CHECK_EQ(stillOld[0], oldReference[500]);
 
     // Reference: an independent offline engine given the exact same
     // (new) params and source -- the same equivalence this file's
@@ -231,6 +272,9 @@ AKZ_TEST(realtime_player_stretch_affecting_change_resets_read_position_to_zero) 
     akz_stretch_engine_process(offline, reference.data(), refLen);
     akz_stretch_engine_destroy(offline);
 
+    akz_realtime_player_commit_pending(player);
+    AKZ_CHECK(!akz_realtime_player_has_pending_commit(player)); // consumed
+
     float one[1];
     akz_realtime_player_pull(player, one, 1);
     AKZ_CHECK_EQ(one[0], reference[0]);
@@ -238,17 +282,16 @@ AKZ_TEST(realtime_player_stretch_affecting_change_resets_read_position_to_zero) 
     akz_realtime_player_destroy(player);
 }
 
-AKZ_TEST(two_independent_players_stay_in_sync_across_staggered_stretch_changes) {
+AKZ_TEST(two_independent_players_commit_gated_together_stay_in_sync) {
     // Direct regression test for the actual reported scenario, rather
     // than just the single-instance mechanism above: LiveAuditionController
     // (LiveAuditionController.swift) owns one independent
-    // RealtimeStretchPlayer per channel and forwards the same
-    // setParams() to each in a plain loop -- there is no cross-instance
-    // synchronisation, so if either instance's worker thread happens to
-    // finish a re-render meaningfully later than the other's, this test
-    // reproduces that staggering directly with a real sleep between the
-    // two setParams() calls, standing in for two channels' independent
-    // worker threads being scheduled at different times.
+    // RealtimeStretchPlayer per channel, each with its own worker
+    // thread, and its render callback only calls commitPending() on
+    // every channel once ALL of them report hasPendingCommit() true --
+    // simulated here exactly, with a real stagger between the two
+    // setParams() calls standing in for two channels' independent
+    // worker threads being scheduled at different wall-clock times.
     auto source = makeRamp(2000);
     AkzStretchParams params;
     akz_stretch_params_default(AkzMachine_S1000, &params);
@@ -263,8 +306,22 @@ AKZ_TEST(two_independent_players_stay_in_sync_across_staggered_stretch_changes) 
     akz_realtime_player_set_source(right, source.data(), source.size());
     akz_realtime_player_set_params(left, &params);
     akz_realtime_player_set_params(right, &params);
-    waitUntilReady(left);
-    waitUntilReady(right);
+
+    // The render callback's gate, in miniature: wait until every channel
+    // has a pending commit, then commit them all in one go.
+    auto gateCommitBoth = [&] {
+        int waited = 0;
+        while ((!akz_realtime_player_has_pending_commit(left) || !akz_realtime_player_has_pending_commit(right))
+               && waited < 2000) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            waited += 2;
+        }
+        AKZ_CHECK(akz_realtime_player_has_pending_commit(left));
+        AKZ_CHECK(akz_realtime_player_has_pending_commit(right));
+        akz_realtime_player_commit_pending(left);
+        akz_realtime_player_commit_pending(right);
+    };
+    gateCommitBoth(); // a fresh player's first render is stretch-affecting too
 
     // Advance both channels identically, exactly as the same render
     // callback pulling the same frameCount from every channel would.
@@ -272,20 +329,36 @@ AKZ_TEST(two_independent_players_stay_in_sync_across_staggered_stretch_changes) 
     akz_realtime_player_pull(left, discard, 500);
     akz_realtime_player_pull(right, discard, 500);
 
-    // The stretch-affecting change (cycle length), staggered: left's
-    // "worker" gets it and 100ms to finish before right's even arrives --
-    // simulating exactly the thread-scheduling skew the bug report was
-    // about. Left may keep advancing on the OLD buffer during that gap.
+    // The stretch-affecting change, staggered: left's worker gets it and
+    // 100ms head start before right's even arrives -- the exact
+    // thread-scheduling skew the bug report was about.
     params.cycleLengthSamples = 300;
     akz_realtime_player_set_params(left, &params);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    akz_realtime_player_set_params(right, &params);
-    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // let both finish
 
-    // Both channels must land on the exact same sample, every step of
-    // the way -- not just once, but continuously, as live audition
-    // actually plays. Divergence here is exactly what would be heard as
-    // stereo widening/comb artifacts.
+    // While only LEFT has a pending commit, the gate must refuse to
+    // commit either one -- this is the actual mechanism of the fix, not
+    // just its eventual outcome. Prove it directly: pull from both now,
+    // with nothing committed, and they must still be identical, still on
+    // the OLD buffer.
+    AKZ_CHECK(akz_realtime_player_has_pending_commit(left));
+    AKZ_CHECK(!akz_realtime_player_has_pending_commit(right)); // hasn't even been asked yet
+    float leftMid[32];
+    float rightMid[32];
+    akz_realtime_player_pull(left, leftMid, 32);
+    akz_realtime_player_pull(right, rightMid, 32);
+    bool stillInSyncDuringGap = true;
+    for (int i = 0; i < 32; ++i) {
+        if (leftMid[i] != rightMid[i]) { stillInSyncDuringGap = false; break; }
+    }
+    AKZ_CHECK(stillInSyncDuringGap);
+
+    akz_realtime_player_set_params(right, &params);
+    gateCommitBoth();
+
+    // Both channels must land on the exact same sample once committed
+    // together, every step of the way -- not just once, but
+    // continuously, as live audition actually plays.
     float leftBuf[64];
     float rightBuf[64];
     akz_realtime_player_pull(left, leftBuf, 64);

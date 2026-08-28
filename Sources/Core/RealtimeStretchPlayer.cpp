@@ -110,39 +110,45 @@ void RealtimeStretchPlayer::_workerLoop() {
             rendered->resize(written);
         }
 
-        std::atomic_store(&_published, std::shared_ptr<const std::vector<float>>(rendered));
-
-        const size_t newLen = rendered->size();
         if (canTakeCheapPath) {
-            // Same length by construction (filter/resonance only affect
-            // sample values, never buffer length) -- leave the read
-            // position exactly where it was instead of restarting.
+            // Filter/resonance-only: publish immediately, no cross-channel
+            // coordination needed. Same length by construction (filter/
+            // resonance only affect sample values, never buffer length)
+            // -- leave the read position exactly where it was instead of
+            // restarting.
+            std::atomic_store(&_published, std::shared_ptr<const std::vector<float>>(rendered));
+            const size_t newLen = rendered->size();
             _readPos.store(newLen > 0 ? std::min(oldPos, newLen - 1) : 0, std::memory_order_relaxed);
         } else {
-            // A stretch/cycle/mode/transpose change can change the
-            // buffer length. This used to remap the position
-            // proportionally (oldPos/oldLen * newLen) so playback resumed
-            // near the same musical position instead of restarting --
-            // reverted after a real regression report: LiveAuditionController
-            // runs one independent RealtimeStretchPlayer PER CHANNEL, each
-            // with its own background worker racing the others. oldPos is
-            // a live, continuously-advancing value; whichever channel's
-            // worker happens to finish first captures it, jumps to the
-            // remapped position, and stops advancing on the old buffer --
-            // while the other channel's worker (delayed by ordinary thread
-            // scheduling) is still reading a LARGER oldPos moments later,
-            // since that channel kept playing the old buffer in the
-            // meantime. The two channels then remap to genuinely different
-            // positions and stay permanently desynchronised -- heard as
-            // stereo widening/comb artifacts, worst on the cycle-length
-            // slider (a full re-render on every drag tick). Resetting to a
-            // fixed constant (0) is immune to this: every channel's
-            // worker converges on the exact same value regardless of when
-            // it happens to run, so all channels stay in lockstep. The
-            // filter-only cheap path above has no such risk -- it never
-            // touches _readPos at all, so channels that were already in
-            // sync simply stay in sync.
-            _readPos.store(0, std::memory_order_relaxed);
+            // A stretch/cycle/mode/transpose change can change the buffer
+            // length, which means the read position has to reset to a
+            // fixed point (0) rather than remap proportionally -- see the
+            // now-historical version of this comment in git blame for the
+            // permanent-desync bug that reasoning fixed. But resetting
+            // _readPos here, the instant THIS channel's own worker
+            // finishes, has a bug of its own: LiveAuditionController runs
+            // one independent RealtimeStretchPlayer PER CHANNEL, each
+            // with its own worker thread racing the others. Whichever
+            // channel's worker finishes first would swap to the new
+            // (possibly different-length/content) buffer and start
+            // playing it from 0, while a sibling channel -- still
+            // finishing the SAME change -- keeps playing the OLD buffer
+            // for however long that gap lasts. For that whole window the
+            // channels are playing genuinely different audio
+            // simultaneously: heard as artificial stereo width, on every
+            // stretch-affecting knob (Transpose, Stretch, Cycle, Quality,
+            // Width, Mode), not just the one that happened to be under
+            // test when this was last diagnosed.
+            //
+            // So: stash the render as PENDING instead of publishing it.
+            // commitPending() (render-thread safe) does the actual
+            // publish + readPos reset, and LiveAuditionController's
+            // render callback only calls it once every sibling channel
+            // also has a pending commit ready -- committing all channels
+            // together, in the same callback invocation, so every
+            // channel's readPos hits 0 on the exact same audio frame
+            // instead of whenever its own worker happened to finish.
+            std::atomic_store(&_pendingPublish, std::shared_ptr<const std::vector<float>>(rendered));
         }
 
         _lastRenderedParams = localParams;
@@ -169,6 +175,24 @@ size_t RealtimeStretchPlayer::pull(float* outFrames, size_t maxOutFrames) {
 
 bool RealtimeStretchPlayer::isReady() const {
     return std::atomic_load(&_published) != nullptr;
+}
+
+bool RealtimeStretchPlayer::hasPendingCommit() const {
+    return std::atomic_load(&_pendingPublish) != nullptr;
+}
+
+void RealtimeStretchPlayer::commitPending() {
+    std::shared_ptr<const std::vector<float>> pending = std::atomic_load(&_pendingPublish);
+    if (!pending) return;
+    std::atomic_store(&_published, pending);
+    _readPos.store(0, std::memory_order_relaxed);
+    // Clear it rather than leave the stale pointer around -- otherwise a
+    // second commitPending() call with no new render in between would
+    // re-publish (harmlessly, since it's the same buffer + already-0
+    // position) but hasPendingCommit() would keep reporting true forever,
+    // which would make the caller believe a fresh render is still
+    // waiting when none is.
+    std::atomic_store(&_pendingPublish, std::shared_ptr<const std::vector<float>>(nullptr));
 }
 
 } // namespace akz
@@ -208,4 +232,14 @@ size_t akz_realtime_player_pull(AkzRealtimePlayer* player, float* out_frames, si
 int akz_realtime_player_is_ready(const AkzRealtimePlayer* player) {
     if (!player) return 0;
     return player->impl.isReady() ? 1 : 0;
+}
+
+int akz_realtime_player_has_pending_commit(const AkzRealtimePlayer* player) {
+    if (!player) return 0;
+    return player->impl.hasPendingCommit() ? 1 : 0;
+}
+
+void akz_realtime_player_commit_pending(AkzRealtimePlayer* player) {
+    if (!player) return;
+    player->impl.commitPending();
 }
