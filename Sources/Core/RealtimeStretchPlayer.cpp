@@ -85,8 +85,9 @@ void RealtimeStretchPlayer::_workerLoop() {
         const bool canTakeCheapPath = !sourceChangedThisIteration && _haveRendered
             && StretchEngine::paramsDifferOnlyInFilter(_lastRenderedParams, localParams);
 
-        const std::shared_ptr<const std::vector<float>> previousBuf = std::atomic_load(&_published);
-        const size_t oldLen = previousBuf ? previousBuf->size() : 0;
+        // Only needed by the cheap (filter-only) path below -- see its
+        // comment, and the one on the full-re-render path, for why the
+        // full path deliberately does NOT read or reuse this.
         const size_t oldPos = _readPos.load(std::memory_order_relaxed);
 
         std::shared_ptr<std::vector<float>> rendered;
@@ -119,17 +120,29 @@ void RealtimeStretchPlayer::_workerLoop() {
             _readPos.store(newLen > 0 ? std::min(oldPos, newLen - 1) : 0, std::memory_order_relaxed);
         } else {
             // A stretch/cycle/mode/transpose change can change the
-            // buffer length. Rather than always snapping back to 0 (the
-            // old, unconditional behaviour the "restarts on every slide
-            // movement" report was about), remap the position
-            // proportionally so playback resumes near the same musical
-            // position instead of visibly restarting.
-            size_t newPos = 0;
-            if (oldLen > 0 && newLen > 0) {
-                newPos = static_cast<size_t>((static_cast<double>(oldPos) / static_cast<double>(oldLen)) * static_cast<double>(newLen));
-                newPos = std::min(newPos, newLen - 1);
-            }
-            _readPos.store(newPos, std::memory_order_relaxed);
+            // buffer length. This used to remap the position
+            // proportionally (oldPos/oldLen * newLen) so playback resumed
+            // near the same musical position instead of restarting --
+            // reverted after a real regression report: LiveAuditionController
+            // runs one independent RealtimeStretchPlayer PER CHANNEL, each
+            // with its own background worker racing the others. oldPos is
+            // a live, continuously-advancing value; whichever channel's
+            // worker happens to finish first captures it, jumps to the
+            // remapped position, and stops advancing on the old buffer --
+            // while the other channel's worker (delayed by ordinary thread
+            // scheduling) is still reading a LARGER oldPos moments later,
+            // since that channel kept playing the old buffer in the
+            // meantime. The two channels then remap to genuinely different
+            // positions and stay permanently desynchronised -- heard as
+            // stereo widening/comb artifacts, worst on the cycle-length
+            // slider (a full re-render on every drag tick). Resetting to a
+            // fixed constant (0) is immune to this: every channel's
+            // worker converges on the exact same value regardless of when
+            // it happens to run, so all channels stay in lockstep. The
+            // filter-only cheap path above has no such risk -- it never
+            // touches _readPos at all, so channels that were already in
+            // sync simply stay in sync.
+            _readPos.store(0, std::memory_order_relaxed);
         }
 
         _lastRenderedParams = localParams;
