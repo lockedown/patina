@@ -38,6 +38,24 @@ public:
     size_t pull(float* outFrames, size_t maxOutFrames);
     bool isReady() const;
 
+    // Render-thread safe, non-blocking: true once a stretch-affecting
+    // re-render has finished on the worker thread and is waiting to be
+    // swapped in via commitPending(). See commitPending()'s comment, and
+    // LiveAuditionController.swift, for why the swap is deferred rather
+    // than automatic -- this player has no idea whether sibling channels
+    // (each with their own independent worker) have finished the SAME
+    // change yet, and swapping in unilaterally is exactly the bug this
+    // pair of methods exists to fix.
+    bool hasPendingCommit() const;
+
+    // Render-thread safe: swaps the pending stretch-affecting re-render
+    // into the published buffer and resets the read position to 0.
+    // No-op if nothing is pending. The caller MUST only call this once
+    // every sibling channel's hasPendingCommit() is also true, and MUST
+    // commit every channel in the same render-callback invocation --
+    // see LiveAuditionController.swift's render callback.
+    void commitPending();
+
 private:
     void _workerLoop();
 
@@ -78,6 +96,14 @@ private:
     // strict wait-free lock-free code.
     std::shared_ptr<const std::vector<float>> _published;
     std::atomic<size_t> _readPos{0};
+
+    // Worker -> render-thread handoff for a stretch-affecting re-render,
+    // held here rather than published/committed directly -- see
+    // commitPending()'s comment above for why. Filter-only cheap-path
+    // renders skip this entirely and publish straight to _published,
+    // since they never touch length or read position and so need no
+    // cross-channel gating.
+    std::shared_ptr<const std::vector<float>> _pendingPublish;
 };
 
 } // namespace akz
