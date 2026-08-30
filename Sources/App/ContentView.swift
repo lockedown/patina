@@ -728,15 +728,52 @@ struct ContentView: View {
 
     /// NSItemProvider's URL retrieval is async, but onDrop's `perform`
     /// must answer synchronously whether the drop is accepted -- return
-    /// true here (the drag is a fileURL per the declared onDrop types)
-    /// and do the actual load once the URL resolves.
+    /// true here (the drag conforms to one of our accepted types) and do
+    /// the actual load once the file resolves.
+    ///
+    /// loadFileRepresentation(forTypeIdentifier:), not a public.file-url
+    /// lookup -- diagnostic logging showed a real dragged item registering
+    /// ONLY its concrete content type ("com.microsoft.waveform-audio"),
+    /// with no "public.file-url" representation at all: this drag source
+    /// vends the file's raw bytes directly, not a URL reference, so
+    /// anything that only asked for public.file-url was guaranteed to
+    /// reject it. loadFileRepresentation handles both cases uniformly --
+    /// for a real file-url-backed provider it hands back that file
+    /// directly; for a data-backed one (this case) the system writes the
+    /// bytes to a temp file first and hands back that instead. Either
+    /// way the URL is valid only for the duration of the completion
+    /// closure (the system deletes its temp copy right after), so it's
+    /// copied into our own temp location before returning to the main
+    /// actor.
     private func _handleDrop(providers: [NSItemProvider]) -> Bool {
-        guard let provider = providers.first(where: { $0.canLoadObject(ofClass: URL.self) }) else {
+        guard let provider = providers.first else { return false }
+        let candidateTypes = [UTType.wav.identifier, UTType.aiff.identifier, UTType.fileURL.identifier]
+        guard let typeID = candidateTypes.first(where: { provider.hasItemConformingToTypeIdentifier($0) }) else {
             return false
         }
-        provider.loadDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { data, _ in
-            guard let data, let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-            DispatchQueue.main.async { _loadDroppedURL(url) }
+
+        provider.loadFileRepresentation(forTypeIdentifier: typeID) { url, error in
+            guard let url else {
+                DispatchQueue.main.async {
+                    statusMessage = "Couldn't read the dropped file" + (error.map { ": \($0.localizedDescription)" } ?? ".")
+                }
+                return
+            }
+            do {
+                // Copy synchronously, inside this closure -- url itself
+                // stops being valid the moment it returns.
+                let stagingDir = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("AkaizerS-Drop", isDirectory: true)
+                    .appendingPathComponent(UUID().uuidString, isDirectory: true)
+                try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+                let destination = stagingDir.appendingPathComponent(url.lastPathComponent)
+                try FileManager.default.copyItem(at: url, to: destination)
+                DispatchQueue.main.async { _loadDroppedURL(destination) }
+            } catch {
+                DispatchQueue.main.async {
+                    statusMessage = "Couldn't read the dropped file: \(error.localizedDescription)"
+                }
+            }
         }
         return true
     }
@@ -748,18 +785,25 @@ struct ContentView: View {
         // brand-new sample.
         let dragTempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("AkaizerS-Drag", isDirectory: true)
-        guard !url.path.hasPrefix(dragTempDir.path) else { return }
+        guard !url.path.hasPrefix(dragTempDir.path) else {
+            return
+        }
         _load(url: url)
     }
 
-    /// Deletes leftover drag-out export files (see ProcessedWavExport.swift)
-    /// from previous runs. There's no reliable "the receiver finished
-    /// copying the promised file" callback through .draggable, so cleanup
-    /// is a sweep on next launch rather than delete-on-completion -- worst
-    /// case is a harmless leak in the OS temp dir until this runs again.
+    /// Deletes leftover temp files from previous runs -- both the
+    /// drag-OUT export staging dir (ProcessedWavExport.swift; there's no
+    /// reliable "the receiver finished copying" callback through
+    /// .draggable, so cleanup is a sweep on next launch rather than
+    /// delete-on-completion) and the drag-IN staging dir (_handleDrop
+    /// above, for drag sources that vend raw content instead of a
+    /// public.file-url). Worst case either way is a harmless leak in the
+    /// OS temp dir until this runs again.
     private func _sweepDragExportTempFiles() {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("AkaizerS-Drag", isDirectory: true)
-        try? FileManager.default.removeItem(at: dir)
+        for name in ["AkaizerS-Drag", "AkaizerS-Drop"] {
+            let dir = FileManager.default.temporaryDirectory.appendingPathComponent(name, isDirectory: true)
+            try? FileManager.default.removeItem(at: dir)
+        }
     }
 
     private func saveCopy() {
