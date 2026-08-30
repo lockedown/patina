@@ -99,4 +99,12 @@ public final class LiveAuditionController {
     }
 
     public var running: Bool { isRunning }
+
+    /// True while any channel's player is actively re-rendering. One
+    /// channel busy is enough to call the whole thing "recomputing" --
+    /// the point is telling the user something is happening, not
+    /// precisely which channel.
+    public var isRecomputing: Bool {
+        players.contains { $0.isRecomputing }
+    }
 }

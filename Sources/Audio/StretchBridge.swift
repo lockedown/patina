@@ -130,6 +130,14 @@ public final class RealtimePlayer {
     public func commitPending() {
         akz_realtime_player_commit_pending(player)
     }
+
+    /// Render-thread safe, non-blocking. True only while the worker is
+    /// actively re-rendering -- unlike isReady above, this genuinely
+    /// toggles back to false, so it's the one that can drive a
+    /// "recomputing" UI indicator.
+    public var isRecomputing: Bool {
+        akz_realtime_player_is_recomputing(player) != 0
+    }
 }
 
 public extension AkzMachineProfile {

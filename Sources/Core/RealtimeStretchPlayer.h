@@ -48,6 +48,15 @@ public:
     // pair of methods exists to fix.
     bool hasPendingCommit() const;
 
+    // Render-thread safe, non-blocking: true while the worker thread is
+    // actively re-rendering (from the moment a change is confirmed dirty
+    // to the moment its result publishes), false at rest. Unlike
+    // isReady() -- which latches true forever after the first publish
+    // and so can never report a re-render -- this one genuinely toggles,
+    // for a "recomputing" UI indicator on a slow re-render (see
+    // AkaizerCore.h's comment on akz_realtime_player_is_recomputing).
+    bool isRecomputing() const;
+
     // Render-thread safe: swaps the pending stretch-affecting re-render
     // into the published buffer and resets the read position to 0.
     // No-op if nothing is pending. The caller MUST only call this once
@@ -85,6 +94,13 @@ private:
     // _workerLoop()'s comment for why this matters for live audition.
     AkzStretchParams _lastRenderedParams{};
     bool _haveRendered = false;
+
+    // Set true by the worker once a change is confirmed dirty, cleared
+    // once its result has published -- read from the main thread by
+    // isRecomputing(), written only by the worker, so a plain atomic
+    // (no shared_ptr machinery needed, unlike _published/_pendingPublish
+    // above -- this is just a flag, not a buffer).
+    std::atomic<bool> _recomputing{false};
 
     // Worker -> render-thread publish. A local shared_ptr copy in pull()
     // holds a strong reference for the duration of the call, so the
