@@ -32,5 +32,13 @@ struct AkaizerSApp: App {
         WindowGroup {
             ContentView()
         }
+        // Parameter undo/redo (see ParamSnapshot, ContentView's
+        // undoStack/redoStack) -- replacing the system Undo/Redo item
+        // rather than adding a separate one, since this app has no other
+        // undo to speak of. See EditCommands.swift for the
+        // ParamEditMenuCommands/focusedSceneValue bridge.
+        .commands {
+            ParamEditMenuCommands()
+        }
     }
 }

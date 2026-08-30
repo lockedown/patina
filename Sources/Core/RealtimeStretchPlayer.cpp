@@ -74,6 +74,12 @@ void RealtimeStretchPlayer::_workerLoop() {
             continue; // nothing to render yet -- e.g. params arrived before a source was ever loaded
         }
 
+        // A real job is confirmed from here through the publish below --
+        // set for the whole render, not just the (possibly slow) full
+        // path, so isRecomputing() reports true for the cheap filter-only
+        // path too, however briefly.
+        _recomputing.store(true, std::memory_order_relaxed);
+
         // Only a filter/resonance-only change (dragging Cutoff/Resonance
         // while live audition is running -- the reported "restarts on
         // every slide movement" case) can take the cheap path: redo just
@@ -153,6 +159,7 @@ void RealtimeStretchPlayer::_workerLoop() {
 
         _lastRenderedParams = localParams;
         _haveRendered = true;
+        _recomputing.store(false, std::memory_order_relaxed);
     }
 }
 
@@ -179,6 +186,10 @@ bool RealtimeStretchPlayer::isReady() const {
 
 bool RealtimeStretchPlayer::hasPendingCommit() const {
     return std::atomic_load(&_pendingPublish) != nullptr;
+}
+
+bool RealtimeStretchPlayer::isRecomputing() const {
+    return _recomputing.load(std::memory_order_relaxed);
 }
 
 void RealtimeStretchPlayer::commitPending() {
@@ -237,6 +248,11 @@ int akz_realtime_player_is_ready(const AkzRealtimePlayer* player) {
 int akz_realtime_player_has_pending_commit(const AkzRealtimePlayer* player) {
     if (!player) return 0;
     return player->impl.hasPendingCommit() ? 1 : 0;
+}
+
+int akz_realtime_player_is_recomputing(const AkzRealtimePlayer* player) {
+    if (!player) return 0;
+    return player->impl.isRecomputing() ? 1 : 0;
 }
 
 void akz_realtime_player_commit_pending(AkzRealtimePlayer* player) {

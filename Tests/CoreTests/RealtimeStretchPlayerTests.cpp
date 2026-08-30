@@ -373,6 +373,49 @@ AKZ_TEST(two_independent_players_commit_gated_together_stay_in_sync) {
     akz_realtime_player_destroy(right);
 }
 
+AKZ_TEST(realtime_player_is_recomputing_toggles_true_then_false_across_a_render) {
+    // Unlike is_ready() (latches true forever after the first publish and
+    // so can never report a LATER re-render), is_recomputing() must
+    // genuinely toggle back to false -- this is what drives the app's
+    // "recomputing" busy light (ContentView.swift's Preview button /
+    // isRecomputingVisible), added because is_ready() turned out unable
+    // to serve that purpose.
+    auto source = makeRamp(2000000); // large enough that the worker's render takes measurable (multi-poll-interval) time
+    AkzStretchParams params;
+    akz_stretch_params_default(AkzMachine_S1000, &params);
+    params.timeFactorPercent = 150.0f;
+    params.cycleLengthSamples = 500;
+
+    AkzRealtimePlayer* player = akz_realtime_player_create(44100.0);
+    AKZ_CHECK(!akz_realtime_player_is_recomputing(player)); // false at rest, before any work is queued
+
+    akz_realtime_player_set_source(player, source.data(), source.size());
+    akz_realtime_player_set_params(player, &params);
+
+    // Poll tightly right after triggering the render, rather than a fixed
+    // sleep, to catch the busy window without guessing its length.
+    bool observedTrue = false;
+    for (int i = 0; i < 20000 && !observedTrue; ++i) {
+        if (akz_realtime_player_is_recomputing(player)) {
+            observedTrue = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+    AKZ_CHECK(observedTrue);
+
+    waitUntilReady(player);
+    AKZ_CHECK(akz_realtime_player_is_ready(player));
+    // _recomputing clears at the very end of the same worker iteration
+    // that publishes, so this should already be false by the time
+    // is_ready() is true -- a short grace period keeps the assertion
+    // robust against scheduling jitter rather than racing it exactly.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    AKZ_CHECK(!akz_realtime_player_is_recomputing(player));
+
+    akz_realtime_player_destroy(player);
+}
+
 AKZ_TEST(realtime_player_survives_concurrent_param_changes_while_pulling) {
     // Simulates the app's actual concurrency pattern: one thread pulls
     // continuously (the render thread) while another thread hammers

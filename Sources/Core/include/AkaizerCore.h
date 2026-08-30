@@ -245,6 +245,16 @@ int akz_realtime_player_is_ready(const AkzRealtimePlayer* player);
 // to 0 on the exact same audio frame.
 int akz_realtime_player_has_pending_commit(const AkzRealtimePlayer* player);
 
+// Render-thread safe, non-blocking. Non-zero WHILE the background worker
+// is actively re-rendering (from the moment a change is confirmed dirty
+// until its result publishes), zero at rest. Unlike
+// akz_realtime_player_is_ready above -- which latches non-zero forever
+// after the first publish and so can never report a later re-render --
+// this one genuinely toggles, for a "recomputing" UI indicator on a slow
+// re-render (a known gap flagged in the project README before this was
+// added: no visual cue during live audition's background recompute).
+int akz_realtime_player_is_recomputing(const AkzRealtimePlayer* player);
+
 // Render-thread safe. Swaps the pending re-render (if any) into the
 // published buffer and resets the read position to 0; a no-op if
 // akz_realtime_player_has_pending_commit() was false. See that

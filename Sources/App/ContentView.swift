@@ -32,6 +32,7 @@
 import AkaizerAudio
 import AkaizerCore
 import AppKit
+import Combine
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -54,6 +55,44 @@ struct ContentView: View {
 
     @State private var isLiveAuditionOn = false
     @State private var liveController: LiveAuditionController?
+
+    /// True while a Finder drag is hovering the window -- drives the
+    /// drop-target highlight overlay only.
+    @State private var isDropTargeted = false
+
+    /// Undo/redo covers the ten parameters only (see ParamSnapshot) -- not
+    /// file loads, not the processed render. A knob drag collapses into
+    /// one step via _beginParamEdit/_endParamEdit, bracketed by
+    /// RotaryKnobView's onEditingChanged; discrete controls (Engine,
+    /// Mode, Machine) push a step directly from their binding setter
+    /// instead, since they have no drag to bracket.
+    @State private var undoStack: [ParamSnapshot] = []
+    @State private var redoStack: [ParamSnapshot] = []
+    /// The snapshot taken when the currently-open drag/edit began, if
+    /// any. Closed (and, if the value actually changed, pushed to
+    /// undoStack) by _endParamEdit.
+    @State private var pendingEditSnapshot: ParamSnapshot?
+    private let maxUndoDepth = 64
+
+    /// Params the current processedChannels render was made with -- lets
+    /// the UI (and the drag-out export) tell a stale render from a fresh
+    /// one without disabling anything, since a stale render is still
+    /// valid audio.
+    @State private var renderedSnapshot: ParamSnapshot?
+
+    /// "Recomputing" busy light for the Preview button (README's "no
+    /// visual cue during a slow re-render" gap). Polled rather than
+    /// pushed -- LiveAuditionController's readiness lives on a
+    /// std::atomic<bool> written by a C++ worker thread, so there's
+    /// nothing to subscribe to; polling a render-thread-safe atomic from
+    /// the main thread is the same discipline the app already uses for
+    /// isReady/hasPendingCommit. Hysteresis (150ms delay before showing,
+    /// 250ms minimum once shown) keeps it from strobing on every knob
+    /// tick during a run of fast, filter-only re-renders.
+    @State private var isRecomputingVisible = false
+    @State private var _recomputingBusySince: Date?
+    @State private var _recomputingVisibleUntil: Date?
+    private let _recomputingPollTimer = Timer.publish(every: 0.05, on: .main, in: .common).autoconnect()
 
     /// True while AudioPlaybackController is playing (Play Original or
     /// Play Processed) -- drives the Stop button's enabled state and
@@ -168,11 +207,55 @@ struct ContentView: View {
             _mainContent
         }
         .frame(minWidth: 720, minHeight: 600)
+        // Attached to the whole window's root, not to any child --
+        // drag-and-drop is NSDraggingDestination, a different mechanism
+        // from gesture recognition, so nested ScrollViews and the knobs'
+        // own DragGestures never consume it. One modifier here genuinely
+        // covers the sidebar, the knobs, and the horizontal knob
+        // scroller, matching the feedback's "drop anywhere in the
+        // window."
+        // Declared types match openFile()'s NSOpenPanel filter ([.wav,
+        // .aiff]) rather than the generic .fileURL -- Finder's own drag
+        // eligibility check (the "no" cursor) then rejects a .txt or
+        // .mp3 before this view is even asked, no extension-sniffing
+        // needed here. .aiff covers both .aiff and .aif by UTType
+        // conformance. onDrop with a URL-conforming NSItemProvider
+        // (rather than .dropDestination(for: URL.self), which has a
+        // documented history of failing to decode Finder's own
+        // public.file-url payload) is the reliable path -- verified
+        // against a real Finder drag, not just the simulator/preview.
+        .onDrop(of: [.wav, .aiff], isTargeted: $isDropTargeted, perform: _handleDrop)
+        .overlay {
+            if isDropTargeted {
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(Color.accentColor, lineWidth: 3)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.08)))
+                    .overlay(
+                        Text("Drop a WAV or AIFF to load it")
+                            .font(.headline)
+                            .foregroundStyle(Color.accentColor)
+                    )
+                    .padding(8)
+                    .allowsHitTesting(false)
+            }
+        }
         .onAppear {
             presets = presetStore.load()
             playback.onFinished = { isPlayingOffline = false }
             _autoloadIfRequested()
+            _sweepDragExportTempFiles()
         }
+        // Bridges the Edit menu's Undo/Redo (AkaizerSApp.swift's
+        // ParamEditMenuCommands, EditCommands.swift) to this struct's own
+        // @State-backed undo stack -- see EditCommands.swift's header for
+        // why a Scene-level menu can't reach a plain @State var directly.
+        .focusedSceneValue(
+            \.paramEdit,
+            ParamEditCommands(
+                canUndo: !undoStack.isEmpty, canRedo: !redoStack.isEmpty,
+                undo: _undo, redo: _redo
+            )
+        )
     }
 
     // -- layout --------------------------------------------------------------
@@ -284,12 +367,21 @@ struct ContentView: View {
                     .disabled(loadedSample == nil)
                 Button("Verify Round Trip", action: verifyRoundTrip)
                     .disabled(loadedSample == nil)
+                Divider()
+                Button { _undo() } label: { Image(systemName: "arrow.uturn.backward") }
+                    .disabled(undoStack.isEmpty)
+                    .help("Undo the last parameter change (⌘Z)")
+                Button { _redo() } label: { Image(systemName: "arrow.uturn.forward") }
+                    .disabled(redoStack.isEmpty)
+                    .help("Redo (⇧⌘Z)")
             }
 
             LCDReadoutView(rows: _lcdRows)
 
-            if loadedSample != nil {
+            if let sample = loadedSample {
                 WaveformView(samples: originalWaveformSamples, overlaySamples: processedWaveformSamples)
+                    .draggable(_dragExport(for: sample))
+                    .help("Drag out to export the processed audio as a .wav")
             }
 
             if let sample = loadedSample {
@@ -312,32 +404,9 @@ struct ContentView: View {
 
             GroupBox("Time stretch") {
                 VStack(alignment: .leading, spacing: 10) {
-                    Picker("Machine", selection: $selectedMachine) {
+                    Picker("Machine", selection: Binding(get: { selectedMachine }, set: _selectMachine)) {
                         ForEach(StretchProcessor.allMachines, id: \.rawValue) { machine in
                             Text(StretchProcessor.profile(for: machine).displayName).tag(machine)
-                        }
-                    }
-                    .onChange(of: selectedMachine) { _, newMachine in
-                        let defaults = StretchProcessor.defaultParams(machine: newMachine)
-                        stretchPercent = Double(defaults.timeFactorPercent)
-                        cycleLength = Double(defaults.cycleLengthSamples)
-                        quality = Double(defaults.quality)
-                        width = Double(defaults.width)
-                        transposeSemitones = Double(defaults.transposeSemitones)
-                        filterCutoff = Double(defaults.filterCutoff01)
-                        filterResonance = Double(defaults.filterResonance01)
-                        // S950 has no CYCLIC/INTELLIGENT switch at all
-                        // (Mon1/Pol2 instead -- plan section 3.2). Force
-                        // the picker back to a real state rather than
-                        // silently ignoring a stale "Intelligent"
-                        // selection the engine itself would ignore too.
-                        if StretchProcessor.profile(for: newMachine).hasModeSwitch == 0 {
-                            selectedMode = AkzStretchMode_Cyclic
-                        }
-                        if StretchProcessor.profile(for: newMachine).supportsTimeStretch == 0 {
-                            isLiveAuditionOn = false // triggers its own onChange -> _stopLiveAudition()
-                        } else {
-                            _pushLiveParamsIfNeeded()
                         }
                     }
                     .onChange(of: selectedEngine) { _, _ in _pushLiveParamsIfNeeded() }
@@ -350,14 +419,14 @@ struct ContentView: View {
                     .onChange(of: filterCutoff) { _, _ in _pushLiveParamsIfNeeded() }
                     .onChange(of: filterResonance) { _, _ in _pushLiveParamsIfNeeded() }
 
-                    Picker("Engine", selection: $selectedEngine) {
+                    Picker("Engine", selection: _undoableBinding(get: { selectedEngine }, set: { selectedEngine = $0 })) {
                         Text("Classic").tag(AkzEngine_Classic)
                         Text("Revised").tag(AkzEngine_Revised)
                     }
                     .pickerStyle(.segmented)
 
                     if _stretchIsSupported && _hasModeSwitch {
-                        Picker("Mode", selection: $selectedMode) {
+                        Picker("Mode", selection: _undoableBinding(get: { selectedMode }, set: { selectedMode = $0 })) {
                             Text("Cyclic").tag(AkzStretchMode_Cyclic)
                             Text("Intelligent").tag(AkzStretchMode_Intelligent)
                         }
@@ -496,15 +565,51 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                     }
 
-                    Toggle("Live Audition", isOn: $isLiveAuditionOn)
-                        .disabled(loadedSample == nil || !_stretchIsSupported)
-                        .onChange(of: isLiveAuditionOn) { _, on in
-                            if on { _startLiveAudition() } else { _stopLiveAudition() }
+                    // Preview -- this IS the "test before committing"
+                    // feature: it previews the fully processed result
+                    // live, with every knob pushing new params in real
+                    // time (isLiveAuditionOn/_startLiveAudition/
+                    // _stopLiveAudition below, unchanged). Feedback from
+                    // real use was that the old "Live Audition" toggle,
+                    // tucked below the knobs, didn't read as that at all
+                    // -- promoted to a prominent play/stop button with a
+                    // busy light for the one real gap that toggle had
+                    // (README's "no recomputing feedback" limitation).
+                    HStack(spacing: 8) {
+                        Button {
+                            isLiveAuditionOn.toggle()
+                        } label: {
+                            Label(
+                                isLiveAuditionOn ? "Stop Preview" : "Preview",
+                                systemImage: isLiveAuditionOn ? "stop.fill" : "play.fill"
+                            )
                         }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(loadedSample == nil || !_stretchIsSupported)
+                        .help("Hear the fully processed result live while you turn the knobs. Nothing is written until you press Process.")
+
+                        if isLiveAuditionOn && isRecomputingVisible {
+                            HStack(spacing: 4) {
+                                ProgressView().controlSize(.small)
+                                Text("recomputing…")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .transition(.opacity)
+                        }
+                    }
+                    .animation(.default, value: isRecomputingVisible)
+                    .onChange(of: isLiveAuditionOn) { _, on in
+                        if on { _startLiveAudition() } else { _stopLiveAudition() }
+                    }
+                    .onReceive(_recomputingPollTimer) { _ in _pollRecomputing() }
 
                     HStack {
                         Button("Process", action: process)
                             .disabled(loadedSample == nil || !_stretchIsSupported)
+                        Button("Revert", action: _revertToOriginal)
+                            .disabled(loadedSample == nil || (_snapshot() == .defaults(for: selectedMachine) && processedChannels == nil))
+                            .help("Reset all parameters to \(machineProfile.displayName) defaults and discard the processed render. Does not modify the file on disk.")
                         // A/B: "compares processed against dry original
                         // at matched loudness" (plan) -- Play Processed
                         // scales its output to match Play Original's RMS
@@ -513,7 +618,7 @@ struct ContentView: View {
                         Button("Play Original", action: playOriginal)
                             .disabled(loadedSample == nil || isLiveAuditionOn)
                             .keyboardShortcut("a", modifiers: [])
-                        Button("Play Processed", action: playProcessed)
+                        Button(_renderIsStale ? "Play Processed (stale)" : "Play Processed", action: playProcessed)
                             .disabled(processedChannels == nil || isLiveAuditionOn)
                             .keyboardShortcut("b", modifiers: [])
                         // One button that stops whichever audio path is
@@ -523,7 +628,7 @@ struct ContentView: View {
                         Button("Stop", action: _stopAllAudio)
                             .disabled(!isPlayingOffline && !isLiveAuditionOn)
                             .keyboardShortcut(".", modifiers: .command)
-                        Button("Save Processed…", action: saveProcessed)
+                        Button(_renderIsStale ? "Save Processed… (stale)" : "Save Processed…", action: saveProcessed)
                             .disabled(processedChannels == nil)
                         Button("Save Preset…", action: _promptSavePreset)
                             .disabled(loadedSample == nil)
@@ -540,25 +645,20 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
-    /// One rack-panel knob: label above, RotaryKnobView, formatted value
-    /// below -- doubling as the value readout the LCD's own summary rows
-    /// (_lcdRows) still cover, but readable at a glance without hunting
-    /// for the field in a wall of text. Double-click/tap resets to
-    /// defaultValue, mirroring a hardware pot's printed centre mark.
+    /// One rack-panel knob -- see KnobCell.swift for the view itself.
+    /// Wires onEditingChanged to ContentView's undo-coalescing pair so
+    /// every knob's drag/reset/typed-value interaction becomes one undo
+    /// step, without each of the seven call sites below having to know
+    /// undo exists.
     private func _knobCell(
         _ label: String, value: Binding<Double>, range: ClosedRange<Double>,
         taper: KnobTaper, step: Double?, defaultValue: Double?, format: String
     ) -> some View {
-        VStack(spacing: 4) {
-            Text(label)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            RotaryKnobView(value: value, range: range, taper: taper, step: step, defaultValue: defaultValue)
-            Text(String(format: format, value.wrappedValue))
-                .font(.system(.caption, design: .monospaced))
-                .foregroundStyle(.primary)
-        }
-        .frame(width: 72)
+        KnobCell(
+            label: label, value: value, range: range, taper: taper, step: step,
+            defaultValue: defaultValue, format: format,
+            onEditingChanged: { $0 ? _beginParamEdit() : _endParamEdit() }
+        )
     }
 
     // -- file actions ------------------------------------------------------
@@ -592,6 +692,7 @@ struct ContentView: View {
             lastVerifyResult = nil
             processedChannels = nil
             processedWaveformSamples = nil
+            renderedSnapshot = nil
             _addToRecentFiles(url)
 
             let interleaved = PCMConversion.toFloat(sample.rawData, format: sample.format)
@@ -621,6 +722,44 @@ struct ContentView: View {
     private func _autoloadIfRequested() {
         guard let path = ProcessInfo.processInfo.environment["AKAIZER_AUTOLOAD_PATH"] else { return }
         _load(url: URL(fileURLWithPath: path))
+    }
+
+    // -- drag-and-drop file loading ------------------------------------------
+
+    /// NSItemProvider's URL retrieval is async, but onDrop's `perform`
+    /// must answer synchronously whether the drop is accepted -- return
+    /// true here (the drag is a fileURL per the declared onDrop types)
+    /// and do the actual load once the URL resolves.
+    private func _handleDrop(providers: [NSItemProvider]) -> Bool {
+        guard let provider = providers.first(where: { $0.canLoadObject(ofClass: URL.self) }) else {
+            return false
+        }
+        provider.loadDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { data, _ in
+            guard let data, let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+            DispatchQueue.main.async { _loadDroppedURL(url) }
+        }
+        return true
+    }
+
+    private func _loadDroppedURL(_ url: URL) {
+        // Ignore the app's own drag-out export temp files -- without
+        // this, dragging the waveform out and back into the same window
+        // would re-import the just-rendered copy as if it were a
+        // brand-new sample.
+        let dragTempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AkaizerS-Drag", isDirectory: true)
+        guard !url.path.hasPrefix(dragTempDir.path) else { return }
+        _load(url: url)
+    }
+
+    /// Deletes leftover drag-out export files (see ProcessedWavExport.swift)
+    /// from previous runs. There's no reliable "the receiver finished
+    /// copying the promised file" callback through .draggable, so cleanup
+    /// is a sweep on next launch rather than delete-on-completion -- worst
+    /// case is a harmless leak in the OS temp dir until this runs again.
+    private func _sweepDragExportTempFiles() {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("AkaizerS-Drag", isDirectory: true)
+        try? FileManager.default.removeItem(at: dir)
     }
 
     private func saveCopy() {
@@ -654,21 +793,146 @@ struct ContentView: View {
 
     // -- stretch actions -----------------------------------------------------
 
+    /// Reads the ten parameter @State vars into one comparable/undoable
+    /// value. The single place both _currentParams() and every bulk-write
+    /// path (undo, revert, preset apply) read from or compare against.
+    private func _snapshot() -> ParamSnapshot {
+        ParamSnapshot(
+            machine: selectedMachine, engine: selectedEngine, mode: selectedMode,
+            stretchPercent: stretchPercent, cycleLength: cycleLength,
+            quality: quality, width: width, transposeSemitones: transposeSemitones,
+            filterCutoff: filterCutoff, filterResonance: filterResonance
+        )
+    }
+
     /// Builds params from the current picker/slider state -- the single
     /// place both the offline Process button and live audition read from,
     /// so they can never drift apart.
     private func _currentParams() -> AkzStretchParams {
-        var params = StretchProcessor.defaultParams(machine: selectedMachine)
-        params.engine = selectedEngine
-        params.mode = selectedMode
-        params.timeFactorPercent = Float(stretchPercent)
-        params.cycleLengthSamples = Int32(cycleLength)
-        params.quality = Int32(quality)
-        params.width = Int32(width)
-        params.transposeSemitones = Float(transposeSemitones)
-        params.filterCutoff01 = Float(filterCutoff)
-        params.filterResonance01 = Float(filterResonance)
-        return params
+        _snapshot().params
+    }
+
+    /// True once processedChannels no longer matches the params it was
+    /// rendered with. Deliberately never used to disable anything -- a
+    /// stale render is still valid audio -- only to mark Play/Save
+    /// Processed and to decide whether a drag-out export needs to
+    /// re-render first.
+    private var _renderIsStale: Bool {
+        processedChannels != nil && renderedSnapshot != _snapshot()
+    }
+
+    // -- undo/redo (params only) ---------------------------------------------
+
+    private func _pushUndo(_ s: ParamSnapshot) {
+        undoStack.append(s)
+        if undoStack.count > maxUndoDepth {
+            undoStack.removeFirst(undoStack.count - maxUndoDepth)
+        }
+        redoStack.removeAll()
+    }
+
+    /// Opens a coalescing transaction. Closes any already-open one first
+    /// (_endParamEdit) so a dropped onEnded -- e.g. the window losing
+    /// focus mid-drag -- gets folded into the next edit instead of
+    /// silently discarding an undo step.
+    private func _beginParamEdit() {
+        _endParamEdit()
+        pendingEditSnapshot = _snapshot()
+    }
+
+    private func _endParamEdit() {
+        guard let before = pendingEditSnapshot else { return }
+        pendingEditSnapshot = nil
+        guard before != _snapshot() else { return } // a drag that changed nothing -> no step
+        _pushUndo(before)
+    }
+
+    private func _undo() {
+        _endParamEdit()
+        guard let previous = undoStack.popLast() else { return }
+        redoStack.append(_snapshot())
+        _applySnapshot(previous)
+        statusMessage = "Undid parameter change."
+    }
+
+    private func _redo() {
+        _endParamEdit()
+        guard let next = redoStack.popLast() else { return }
+        undoStack.append(_snapshot())
+        _applySnapshot(next)
+        statusMessage = "Redid parameter change."
+    }
+
+    /// Wraps a discrete control's own binding (Engine, Mode) so its write
+    /// pushes an undo step. Unlike a knob drag there's no gesture to
+    /// bracket with onEditingChanged, and the control's own onChange
+    /// fires after the write -- so the push happens here, at the point of
+    /// assignment, using the state read just before it.
+    private func _undoableBinding<T: Equatable>(
+        get: @escaping () -> T, set: @escaping (T) -> Void
+    ) -> Binding<T> {
+        Binding(
+            get: get,
+            set: { newValue in
+                guard newValue != get() else { return }
+                _pushUndo(_snapshot())
+                set(newValue)
+            }
+        )
+    }
+
+    /// The Machine picker's binding setter, not an .onChange -- .onChange
+    /// runs during the view-update pass *after* state has already
+    /// settled, not synchronously at the point of assignment, so it can't
+    /// be raced against a bulk write that also touches selectedMachine
+    /// (undo restore, preset apply, revert): whichever one's onChange
+    /// fires later would silently clobber the other. Doing the "new
+    /// machine -> reset everything else" work here instead, synchronously,
+    /// means bulk writes go through _applySnapshot() below and never
+    /// trigger this at all -- there's nothing left to race.
+    private func _selectMachine(_ machine: AkzMachine) {
+        guard machine != selectedMachine else { return }
+        _pushUndo(_snapshot())
+        selectedMachine = machine
+        let defaults = ParamSnapshot.defaults(for: machine)
+        stretchPercent = defaults.stretchPercent
+        cycleLength = defaults.cycleLength
+        quality = defaults.quality
+        width = defaults.width
+        transposeSemitones = defaults.transposeSemitones
+        filterCutoff = defaults.filterCutoff
+        filterResonance = defaults.filterResonance
+        // S950 has no CYCLIC/INTELLIGENT switch at all (Mon1/Pol2
+        // instead -- plan section 3.2). Force the picker back to a real
+        // state rather than silently ignoring a stale "Intelligent"
+        // selection the engine itself would ignore too.
+        if StretchProcessor.profile(for: machine).hasModeSwitch == 0 {
+            selectedMode = AkzStretchMode_Cyclic
+        }
+        if StretchProcessor.profile(for: machine).supportsTimeStretch == 0 {
+            isLiveAuditionOn = false // triggers its own onChange -> _stopLiveAudition()
+        } else {
+            _pushLiveParamsIfNeeded()
+        }
+    }
+
+    /// Assigns all ten params from a snapshot in one shot -- undo restore,
+    /// revert, and preset apply all funnel through this. Assigning
+    /// selectedMachine directly here (never through _selectMachine) is
+    /// what keeps a bulk write from triggering the machine-change reset
+    /// above and clobbering the very values being restored.
+    private func _applySnapshot(_ s: ParamSnapshot) {
+        selectedMachine = s.machine
+        selectedEngine = s.engine
+        selectedMode = s.mode
+        stretchPercent = s.stretchPercent
+        cycleLength = s.cycleLength
+        quality = s.quality
+        width = s.width
+        transposeSemitones = s.transposeSemitones
+        filterCutoff = s.filterCutoff
+        filterResonance = s.filterResonance
+        _pushLiveParamsIfNeeded()
     }
 
     // -- presets ---------------------------------------------------------------
@@ -696,30 +960,64 @@ struct ContentView: View {
         statusMessage = "Saved preset \"\(name)\"."
     }
 
-    /// Applies a preset's params to every slider/picker. Sets
-    /// selectedMachine FIRST, deliberately: that field's own onChange
-    /// resets every other field to the new machine's defaults, so
-    /// anything set after it here (the preset's actual values) is what
-    /// sticks -- setting it last would let the reset clobber the preset.
+    /// Applies a preset's params to every slider/picker via
+    /// _applySnapshot(), which assigns selectedMachine directly rather
+    /// than through _selectMachine -- so the machine-change reset never
+    /// fires and the preset's own values (including its machine) are what
+    /// stick, with no assignment-order dependency to get right.
     private func _applyPreset(_ preset: AkaizerPreset) {
-        let params = preset.params
-        selectedMachine = params.machine
-        selectedEngine = params.engine
-        selectedMode = params.mode
-        stretchPercent = Double(params.timeFactorPercent)
-        cycleLength = Double(params.cycleLengthSamples)
-        quality = Double(params.quality)
-        width = Double(params.width)
-        transposeSemitones = Double(params.transposeSemitones)
-        filterCutoff = Double(params.filterCutoff01)
-        filterResonance = Double(params.filterResonance01)
-        _pushLiveParamsIfNeeded()
+        _pushUndo(_snapshot())
+        _applySnapshot(preset.snapshot)
         statusMessage = "Applied preset \"\(preset.name)\"."
     }
 
     private func _deletePreset(_ preset: AkaizerPreset) {
         presets.removeAll { $0.id == preset.id }
         presetStore.save(presets)
+    }
+
+    // -- revert ------------------------------------------------------------
+
+    /// The app is already non-destructive -- loadedSample.rawData is
+    /// never mutated, and process() re-decodes from it every call -- so
+    /// "revert to original" means discarding the *edit state*, not
+    /// restoring a file. Keeps the current machine (it's closer to a
+    /// document mode than a parameter -- silently jumping to a different
+    /// sampler would be startling) and resets the other nine params to
+    /// that machine's defaults, then discards the render. One undo step;
+    /// undoing it restores the params but not the discarded render --
+    /// that's the honest consequence of undo covering parameters only,
+    /// not something worth papering over by putting [[Float]] buffers in
+    /// the undo stack.
+    private func _revertToOriginal() {
+        _endParamEdit()
+        _pushUndo(_snapshot())
+        _applySnapshot(.defaults(for: selectedMachine))
+        processedChannels = nil
+        processedWaveformSamples = nil
+        renderedSnapshot = nil
+        statusMessage = "Reverted to \(machineProfile.displayName) defaults."
+    }
+
+    // -- recomputing busy light ---------------------------------------------
+
+    private func _pollRecomputing() {
+        let now = Date()
+        let raw = liveController?.isRecomputing ?? false
+
+        if raw {
+            if _recomputingBusySince == nil { _recomputingBusySince = now }
+            if !isRecomputingVisible, let since = _recomputingBusySince, now.timeIntervalSince(since) >= 0.15 {
+                isRecomputingVisible = true
+                _recomputingVisibleUntil = now.addingTimeInterval(0.25)
+            }
+        } else {
+            _recomputingBusySince = nil
+            if isRecomputingVisible, let until = _recomputingVisibleUntil, now >= until {
+                isRecomputingVisible = false
+                _recomputingVisibleUntil = nil
+            }
+        }
     }
 
     /// Stops whichever of the two independent audio engines
@@ -773,25 +1071,12 @@ struct ContentView: View {
     private func process() {
         guard let sample = loadedSample else { return }
 
-        let params = _currentParams()
-
-        let interleaved = PCMConversion.toFloat(sample.rawData, format: sample.format)
-        let inputChannels = PCMConversion.deinterleave(interleaved, channelCount: sample.channelCount)
-
-        // Each channel is stretched independently with identical
-        // parameters -- the real hardware has no notion of stereo
-        // linkage inside the stretch algorithm itself (plan section 2
-        // describes it purely per-sample-stream).
-        var outputChannels: [[Float]] = []
-        for channel in inputChannels {
-            let processor = StretchProcessor(sampleRateHz: sample.sampleRateHz)
-            processor.setParams(params)
-            processor.setSource(channel)
-            outputChannels.append(processor.renderAll())
-        }
+        let snapshot = _snapshot()
+        let outputChannels = ProcessedRender.render(sample: sample, params: snapshot.params)
 
         processedChannels = outputChannels
         processedWaveformSamples = outputChannels.first
+        renderedSnapshot = snapshot
         let outFrames = outputChannels.first?.count ?? 0
         statusMessage = "Processed: \(sample.frameCount) → \(outFrames) frames (\(String(format: "%.2f", Double(outFrames) / sample.sampleRateHz))s)."
     }
@@ -838,6 +1123,33 @@ struct ContentView: View {
             try audioFileService.save(processedSample, to: url)
             statusMessage = "Saved processed audio to \(url.lastPathComponent)."
         }
+    }
+
+    /// Builds the value behind WaveformView's .draggable() -- see
+    /// ProcessedWavExport.swift's header for the full rationale. Cheap by
+    /// design: hands over the current snapshot/cached-channels rather
+    /// than doing any rendering here, so this can be called fresh on
+    /// every body evaluation without cost.
+    private func _dragExport(for sample: LoadedSample) -> ProcessedWavExport {
+        ProcessedWavExport(
+            source: sample,
+            snapshot: _snapshot(),
+            cachedChannels: _renderIsStale ? nil : processedChannels,
+            fileName: sample.url.deletingPathExtension().lastPathComponent + "-stretched.wav",
+            onRendered: { channels, snapshot in
+                // ProcessedWavExport invokes this via `await
+                // MainActor.run`, so it's genuinely always on the main
+                // actor -- assumeIsolated tells the compiler that rather
+                // than hopping again, since the @Sendable closure type
+                // (required to cross into the async export path) can't
+                // itself express that guarantee.
+                MainActor.assumeIsolated {
+                    processedChannels = channels
+                    processedWaveformSamples = channels.first
+                    renderedSnapshot = snapshot
+                }
+            }
+        )
     }
 
     private func _presentSavePanel(for sourceURL: URL, suffix: String, action: (URL) throws -> Void) {
