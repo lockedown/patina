@@ -7,6 +7,8 @@
 #include "TestFramework.h"
 #include "include/AkaizerCore.h"
 
+#include <string>
+
 AKZ_TEST(S950_sample_rate_matches_bandwidth_times_2_5) {
     const AkzMachineProfile* p = akz_machine_profile(AkzMachine_S950);
     AKZ_CHECK(p->hasVariableSampleRate == 1);
@@ -76,6 +78,80 @@ AKZ_TEST(S950_memory_budget_is_rate_independent_sample_points) {
     double secondsAt7500 = static_cast<double>(p->memoryBudgetSamplePoints) / 7500.0;
     AKZ_CHECK_NEAR(secondsAt48k, 9.89, 0.1);
     AKZ_CHECK_NEAR(secondsAt7500, 63.3, 1.0);
+}
+
+AKZ_TEST(every_machine_has_a_unique_nonempty_stable_id) {
+    // What PresetStore.swift's AkaizerPreset.machineId compares against
+    // -- a typo or duplicate here would silently misname presets.
+    const char* seen[AkzMachine_Count] = {};
+    for (int m = 0; m < AkzMachine_Count; ++m) {
+        const AkzMachineProfile* p = akz_machine_profile(static_cast<AkzMachine>(m));
+        AKZ_CHECK(p->stableId != nullptr);
+        AKZ_CHECK(p->stableId[0] != '\0');
+        for (int j = 0; j < m; ++j) {
+            AKZ_CHECK(std::string(seen[j]) != std::string(p->stableId));
+        }
+        seen[m] = p->stableId;
+    }
+}
+
+AKZ_TEST(S3200_is_the_only_machine_with_two_filter_stages) {
+    // Replaces the old ">= 24.0 dB/oct" heuristic -- see AkaizerCore.h's
+    // filterStageCount doc comment.
+    for (int m = 0; m < AkzMachine_Count; ++m) {
+        const AkzMachineProfile* p = akz_machine_profile(static_cast<AkzMachine>(m));
+        int expected = (m == AkzMachine_S3200) ? 2 : 1;
+        AKZ_CHECK_EQ(p->filterStageCount, expected);
+    }
+}
+
+AKZ_TEST(filter_topology_matches_filter_has_resonance) {
+    // filterHasResonance is a UI capability flag; filterTopology is what
+    // FilterModel.cpp actually dispatches on. As of v2 stage 2 (before
+    // stage 6's TPT migration) they must still agree for all six Akai
+    // machines: OnePoleCascade <-> no resonance, ChamberlinSvf <->
+    // resonance.
+    for (int m = 0; m < AkzMachine_Count; ++m) {
+        const AkzMachineProfile* p = akz_machine_profile(static_cast<AkzMachine>(m));
+        if (p->filterHasResonance) {
+            AKZ_CHECK(p->filterTopology == AkzFilterTopology_ChamberlinSvf);
+        } else {
+            AKZ_CHECK(p->filterTopology == AkzFilterTopology_OnePoleCascade);
+        }
+    }
+}
+
+AKZ_TEST(every_machine_and_stage_has_a_provenance_note) {
+    // Completeness guard for the provenance table (v2 heritage-roster
+    // plan, stage 2) -- a missing entry would mean the UI silently shows
+    // nothing for that machine/stage rather than failing a build.
+    for (int m = 0; m < AkzMachine_Count; ++m) {
+        for (int s = 0; s < AkzStage_Count; ++s) {
+            const AkzStageProvenance* entry = akz_machine_stage_provenance(static_cast<AkzMachine>(m), static_cast<AkzStage>(s));
+            AKZ_CHECK(entry != nullptr);
+            AKZ_CHECK(entry->note != nullptr);
+            AKZ_CHECK(entry->note[0] != '\0');
+        }
+    }
+}
+
+AKZ_TEST(rate_and_dac_stages_are_unmodelled_until_their_plan_stages_land) {
+    // Rate/Dac provenance must say Unmodelled for every machine today --
+    // heritage-roster plan stages 4/5 are what changes this, machine by
+    // machine, as the DSP actually gains the capability.
+    for (int m = 0; m < AkzMachine_Count; ++m) {
+        const AkzStageProvenance* rate = akz_machine_stage_provenance(static_cast<AkzMachine>(m), AkzStage_Rate);
+        const AkzStageProvenance* dac = akz_machine_stage_provenance(static_cast<AkzMachine>(m), AkzStage_Dac);
+        AKZ_CHECK(rate->level == AkzProvenanceLevel_Unmodelled);
+        AKZ_CHECK(dac->level == AkzProvenanceLevel_Unmodelled);
+    }
+}
+
+AKZ_TEST(S900_stretch_stage_is_unmodelled_not_just_disabled_in_the_ui) {
+    // supportsTimeStretch == 0 already gates the UI; provenance should
+    // agree at the data level, not just describe the other five.
+    const AkzStageProvenance* stretch = akz_machine_stage_provenance(AkzMachine_S900, AkzStage_Stretch);
+    AKZ_CHECK(stretch->level == AkzProvenanceLevel_Unmodelled);
 }
 
 AKZ_TEST(default_params_are_no_op_and_machine_specific) {

@@ -55,6 +55,21 @@ typedef enum AkzEngine {
     AkzEngine_Revised = 1
 } AkzEngine;
 
+// Filter topology. Replaces v1's overloaded pair (filterHasResonance
+// picking a class, filterSlopeDbPerOctave >= 24.0 picking a stage count)
+// with an explicit selector, so FilterModel.cpp's factory dispatches on
+// a capability field rather than growing a third if-branch per new
+// machine family -- see FilterModel.h for what each topology models and
+// which real chips it stands in for.
+typedef enum AkzFilterTopology {
+    AkzFilterTopology_OnePoleCascade    = 0, // cascaded 1-pole lowpass stages, no resonance -- S900/S950 (analog SC Butterworth stand-in), S1000 (digital moving lowpass)
+    AkzFilterTopology_ChamberlinSvf     = 1, // naive Chamberlin SVF, k<=1.1 stability clamp -- v1/v2-stage2 S2000/S3000/S3200; superseded by TptSvf for these three from stage 6 on
+    AkzFilterTopology_TptSvf            = 2, // zero-delay-feedback SVF, unconditionally stable to Nyquist, unity passband gain by construction -- what S2000/S3000/S3200 migrate to
+    AkzFilterTopology_SsmLadder         = 3, // SSM2044/SSM2045-class 4-pole transistor ladder
+    AkzFilterTopology_CemStateVariable  = 4, // CEM3320/3328-class per-voice resonant state-variable filter
+    AkzFilterTopology_SwitchedCapacitor = 5  // switched-capacitor LPF/HPF pair (e.g. Fairlight's input anti-alias stage)
+} AkzFilterTopology;
+
 // ---------------------------------------------------------------------------
 // Machine profile — read-only per-machine constants
 // ---------------------------------------------------------------------------
@@ -81,10 +96,20 @@ typedef struct AkzMachineProfile {
     int    bitDepth;                  // 12 for S900/S950, 16 for S1000/S2000/S3000, 16 or 18 for S3200
     int    companded;                 // always 0 — none of these machines compand
 
-    // Filter
+    // Filter. filterHasResonance is a UI/capability flag ("does this
+    // machine expose a resonance knob") -- FilterModel.cpp's dispatch
+    // itself switches on filterTopology, not this flag, since a third
+    // topology could have resonance without being a ChamberlinSvf/
+    // TptSvf. filterSlopeDbPerOctave keeps its literal meaning (used
+    // directly as pole count for OnePoleCascade; documentation-only for
+    // the other topologies, whose pole count is a property of the real
+    // chip, not a tunable). filterStageCount replaces the old
+    // ">= 24.0 dB/oct" heuristic for S3200's second series SVF stage.
     int    filterHasResonance;        // 0 for S900/S950/S1000, 1 for S2000/S3000/S3200
     double filterSlopeDbPerOctave;    // 36 analog (S900/S950), 18 digital (S1000), 12 digital SVF (S2000/S3000), 24 (S3200 w/ 2nd filter)
     int    filterTracksPitch;         // 1 only for S900/S950 (per-voice analog filter clocked with the voice)
+    AkzFilterTopology filterTopology; // which class FilterModel.cpp's factory instantiates
+    int    filterStageCount;          // stages of filterTopology run in series (2 for S3200's "2nd DIGITAL FILTER" -> 24dB/oct, 1 otherwise)
 
     // Transposition / interpolation. See MachineProfile.cpp for citations.
     int    interpolatorOrder;         // 0 = none (S900/S950 vary the DAC clock directly), 1 = zero-order hold, 2 = linear
@@ -103,6 +128,47 @@ typedef struct AkzMachineProfile {
 // Returns the profile for a machine. The returned pointer is to static
 // storage and never needs to be freed.
 const AkzMachineProfile* akz_machine_profile(AkzMachine machine);
+
+// ---------------------------------------------------------------------------
+// Provenance — is a modelled stage cited, or this project's inference?
+// ---------------------------------------------------------------------------
+//
+// v1 tracked this in source comments only (`[M]`/`[I]`/`[M/I]` tags in
+// MachineProfile.cpp). v2's fidelity bar is citation-first but allows
+// inference IF IT IS VISIBLE TO THE USER, not just to a reader of the
+// source -- this table is what the UI reads to show that (an inference
+// badge on a knob, a "modelled from..." panel). Every AkzMachine x
+// AkzStage pair has an entry, including AkzProvenanceLevel_Unmodelled
+// for a stage this build's DSP doesn't implement yet (e.g. Rate/Dac
+// before the heritage-roster plan's stage 4/5 land) -- enforced by a
+// completeness test in MachineProfileTests.cpp, not left to be missing.
+
+typedef enum AkzStage {
+    AkzStage_Rate         = 0, // sample-rate/bandwidth front end (decimate + reconstruct)
+    AkzStage_Converter    = 1, // bit-depth quantisation, companding, transfer curve
+    AkzStage_Filter       = 2, // the machine-appropriate VCF
+    AkzStage_Interpolator = 3, // transpose/varispeed interpolation kind
+    AkzStage_Stretch      = 4, // time-stretch algorithm (n/a on machines with none -- Unmodelled, correctly)
+    AkzStage_Dac          = 5, // DAC back end (zero-order hold + reconstruction filter)
+    AkzStage_Count
+} AkzStage;
+
+typedef enum AkzProvenanceLevel {
+    AkzProvenanceLevel_Measured    = 0, // this project measured the real hardware directly
+    AkzProvenanceLevel_Manual      = 1, // a service/owner's manual, datasheet, or MAME-confirmed behavioural reference states this directly
+    AkzProvenanceLevel_Inferred    = 2, // this project's own inference or approximation, flagged as such
+    AkzProvenanceLevel_Unmodelled  = 3  // not implemented by this build's DSP yet, regardless of citation quality
+} AkzProvenanceLevel;
+
+typedef struct AkzStageProvenance {
+    AkzProvenanceLevel level;
+    const char* note; // short human-readable citation or inference note, e.g. "S950 manual: fs = bandwidth * 2.5"
+} AkzStageProvenance;
+
+// Returns provenance for one machine/stage pair. Never NULL -- every
+// combination has an entry (see completeness test above). The returned
+// pointer is to static storage, like akz_machine_profile.
+const AkzStageProvenance* akz_machine_stage_provenance(AkzMachine machine, AkzStage stage);
 
 // ---------------------------------------------------------------------------
 // Stretch parameters

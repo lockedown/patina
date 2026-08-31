@@ -6,6 +6,17 @@
 // FilterModel.cpp). Every field below is annotated with where it came from;
 // figures marked [I] are this project's inference, not a manual citation.
 // Full citations live in the project plan.
+//
+// kProvenance below (v2 heritage-roster plan, stage 2) promotes those same
+// [M]/[I]/[M/I] comment tags to data, one AkzStageProvenance entry per
+// AkzMachine x AkzStage pair, so the app layer can surface "this is cited"
+// vs. "this is this project's inference" to the user, not just to a reader
+// of this file. AkzProvenanceLevel_Unmodelled means exactly that: the DSP
+// doesn't implement this stage yet, independent of how good a citation for
+// it might be (Rate and Dac, before stages 4/5 of the heritage-roster plan
+// land, are Unmodelled for every machine here, matching the real state of
+// StretchEngine.cpp regardless of what the S900/S950 manuals say about
+// bandwidth).
 
 #include "MachineProfile.h"
 
@@ -33,6 +44,8 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* filterHasResonance */      0,                // analog SC Butterworth, no resonance control [M]
         /* filterSlopeDbPerOctave */  36.0,             // 6-pole -> 36 dB/oct
         /* filterTracksPitch */       1,                // per-voice MF6CN-50 clocked with the voice [M/I]
+        /* filterTopology */          AkzFilterTopology_OnePoleCascade,
+        /* filterStageCount */        1,
         /* interpolatorOrder */       0,                // no interpolation -- per-voice DAC clock is varied directly [I]
         /* supportsTimeStretch */     0,                // added in the S950; S900 has none [M]
         /* maxStretchPercent */       0.0,
@@ -53,6 +66,8 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* filterHasResonance */      0,                // analog SC Butterworth, no resonance control [M]
         /* filterSlopeDbPerOctave */  36.0,
         /* filterTracksPitch */       1,                // MF6CN-50 per voice, clock-tracked [M/I]
+        /* filterTopology */          AkzFilterTopology_OnePoleCascade,
+        /* filterStageCount */        1,
         /* interpolatorOrder */       0,                // no interpolation -- per-voice DAC clock varied directly [I]
         /* supportsTimeStretch */     1,
         /* maxStretchPercent */       999.0,            // "Timestretch (up to 999%)" [M]
@@ -73,6 +88,8 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* filterHasResonance */      0,                // "no resonance control, and the filter cannot go into self-oscillation" [M]
         /* filterSlopeDbPerOctave */  18.0,             // "Digital moving low-pass filter (-18dB/octave)" [M]
         /* filterTracksPitch */       0,                // fixed passive LC reconstruction, switched 10/20 kHz by rate, not by pitch [M]
+        /* filterTopology */          AkzFilterTopology_OnePoleCascade,
+        /* filterStageCount */        1,
         /* interpolatorOrder */       2,                // order unstated by Akai; linear assumed pending by-ear revision -- see plan "Known gaps" [I]
         /* supportsTimeStretch */     1,                // added in OS 2.0 [M]
         /* maxStretchPercent */       2000.0,           // "25% of its original length to 2000%" [M]
@@ -93,6 +110,8 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* filterHasResonance */      1,                // identical L7A1045 silicon to the S3000XL, resonant SVF -- manual-confirmed, contra common belief [M]
         /* filterSlopeDbPerOctave */  12.0,             // 2-pole Chamberlin SVF
         /* filterTracksPitch */       0,                // runs at fixed 44.1kHz after pitch interpolation [M/I from MAME device]
+        /* filterTopology */          AkzFilterTopology_ChamberlinSvf, // superseded by TptSvf from v2 stage 6 on -- see AkaizerCore.h
+        /* filterStageCount */        1,
         /* interpolatorOrder */       1,                // zero-order hold, per MAME l7a1045_l6028_dsp_a.cpp: frac bits discarded when addressing [I, best available evidence]
         /* supportsTimeStretch */     1,
         /* maxStretchPercent */       2000.0,
@@ -113,6 +132,8 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* filterHasResonance */      1,                // same L7A1045 silicon as S2000 [M]
         /* filterSlopeDbPerOctave */  12.0,
         /* filterTracksPitch */       0,
+        /* filterTopology */          AkzFilterTopology_ChamberlinSvf, // superseded by TptSvf from v2 stage 6 on
+        /* filterStageCount */        1,
         /* interpolatorOrder */       1,                // zero-order hold, same voice chip as S2000 [I]
         /* supportsTimeStretch */     1,
         /* maxStretchPercent */       2000.0,
@@ -133,6 +154,8 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* filterHasResonance */      1,                // primary L7A1045 filter, same as S2000/S3000
         /* filterSlopeDbPerOctave */  24.0,             // + optional 2nd digital filter (L7A0986 DFL) in series -> 24 dB/oct "Moog-ish" mode [M/I]
         /* filterTracksPitch */       0,
+        /* filterTopology */          AkzFilterTopology_ChamberlinSvf, // superseded by TptSvf from v2 stage 6 on
+        /* filterStageCount */        2,                // the optional "2nd DIGITAL FILTER," both stages lowpass in series [M/I] -- replaces the old ">= 24.0 dB/oct" heuristic
         /* interpolatorOrder */       1,                // zero-order hold, same voice chip family [I]
         /* supportsTimeStretch */     1,
         /* maxStretchPercent */       2000.0,
@@ -140,6 +163,77 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* hasZoneSelect */           1,                // stretch zone + "to" [M]
         /* defaultCycleLength */      1000,             // Cycle length default [M]
         /* memoryBudgetSamplePoints */0,                // up to 32MB; not modelled as a hard constraint
+    },
+};
+
+// Provenance table, indexed [machine][stage], order matching AkzStage
+// (Rate, Converter, Filter, Interpolator, Stretch, Dac). Kept as a
+// separate table rather than folded into kProfiles above because it is
+// himself a fact ABOUT that table's fields, at a finer grain than any
+// one field -- e.g. Filter's note differs for the same filterTopology
+// value depending on which specific machine's citation quality backs it
+// (S2000/S3000's ChamberlinSvf is MAME-confirmed; S900/S950's
+// OnePoleCascade is flagged as an approximation in FilterModel.h's own
+// header comment).
+//
+// A completeness test (MachineProfileTests.cpp) asserts every cell has
+// a non-null note -- this table must be extended in the same commit as
+// any new AkzMachine or AkzStage value, or that test fails loudly rather
+// than the UI silently showing nothing for a gap.
+constexpr AkzStageProvenance kProvenance[AkzMachine_Count][AkzStage_Count] = {
+    // AkzMachine_S900
+    {
+        { AkzProvenanceLevel_Unmodelled, "Bandwidth control (fs = bandwidth * 2.5) not yet implemented in the DSP -- heritage-roster plan stage 4." },
+        { AkzProvenanceLevel_Manual, "12-bit SAR, 12-bit packed storage, no companding -- S900 manual." },
+        { AkzProvenanceLevel_Inferred, "Cascaded one-pole stages approximate the analog SC Butterworth shape; not a precision Butterworth design -- see FilterModel.h." },
+        { AkzProvenanceLevel_Inferred, "No digital interpolator to emulate -- per-voice DAC clock is varied directly, this project's inference from the analog architecture." },
+        { AkzProvenanceLevel_Unmodelled, "S900 has no time-stretch capability at all -- added in the S950 -- Akai manual." },
+        { AkzProvenanceLevel_Unmodelled, "DAC back end (zero-order hold + reconstruction filter) not yet implemented -- heritage-roster plan stage 5." },
+    },
+    // AkzMachine_S950
+    {
+        { AkzProvenanceLevel_Unmodelled, "Bandwidth control (fs = bandwidth * 2.5, confirmed 3 ways) not yet implemented in the DSP -- heritage-roster plan stage 4." },
+        { AkzProvenanceLevel_Manual, "\"12-bit sampling / 16-bit processing,\" no companding -- S950 manual." },
+        { AkzProvenanceLevel_Inferred, "Cascaded one-pole stages approximate the analog SC Butterworth shape; not a precision Butterworth design -- see FilterModel.h." },
+        { AkzProvenanceLevel_Inferred, "No digital interpolator to emulate -- per-voice DAC clock varied directly, this project's inference." },
+        { AkzProvenanceLevel_Manual, "CYCLIC-only time-stretch (Mon1/Pol2, no mode switch), \"Timestretch up to 999%\" -- S950 manual. INTELLIGENT's quality/width->sample-count curve is this project's own design, not a citation." },
+        { AkzProvenanceLevel_Unmodelled, "DAC back end (zero-order hold + reconstruction filter) not yet implemented -- heritage-roster plan stage 5." },
+    },
+    // AkzMachine_S1000
+    {
+        { AkzProvenanceLevel_Unmodelled, "Fixed-rate machine (22050/44100 Hz); no bandwidth stage to model, but the fixed-rate ADC/DAC front/back end itself isn't implemented yet -- heritage-roster plan stages 4/5." },
+        { AkzProvenanceLevel_Manual, "\"16-bit linear encoding,\" no companding -- S1000 manual." },
+        { AkzProvenanceLevel_Inferred, "Cascade approximates the cited -18dB/oct slope; not a precision filter design -- see FilterModel.h." },
+        { AkzProvenanceLevel_Inferred, "Interpolator order unstated by Akai (\"24-bit algorithm, custom VLSI\" is arithmetic precision, not filter order); linear assumed pending a by-ear revision -- README Known limitations." },
+        { AkzProvenanceLevel_Manual, "CYCLIC/INTELLIGENT modes, zone select, \"25% to 2000%\" range -- S1000 manual, added OS 2.0." },
+        { AkzProvenanceLevel_Unmodelled, "DAC back end (zero-order hold + reconstruction filter) not yet implemented -- heritage-roster plan stage 5." },
+    },
+    // AkzMachine_S2000
+    {
+        { AkzProvenanceLevel_Unmodelled, "Fixed-rate machine (22050/44100 Hz); ADC/DAC front/back end not yet implemented -- heritage-roster plan stages 4/5." },
+        { AkzProvenanceLevel_Manual, "16-bit linear, no companding -- S2000 manual." },
+        { AkzProvenanceLevel_Manual, "Resonant SVF, identical L7A1045 silicon to the S3000XL -- manual-confirmed, contra common belief the S2000 lacks resonance. Exact difference equation from the MAME l7a1045_l6028_dsp_a device, used as a behavioural reference and reimplemented, not copied." },
+        { AkzProvenanceLevel_Manual, "Zero-order hold, MAME-confirmed (frac bits discarded when addressing memory in l7a1045_l6028_dsp_a.cpp)." },
+        { AkzProvenanceLevel_Manual, "CYCLIC/INTELLIGENT modes, CYC LENGTH default 1340 -- S2000 manual. INTELLIGENT's quality/width curve is this project's own design, not a citation." },
+        { AkzProvenanceLevel_Unmodelled, "DAC back end (zero-order hold + reconstruction filter) not yet implemented -- heritage-roster plan stage 5." },
+    },
+    // AkzMachine_S3000
+    {
+        { AkzProvenanceLevel_Unmodelled, "Fixed-rate machine (22050/44100 Hz); ADC/DAC front/back end not yet implemented -- heritage-roster plan stages 4/5." },
+        { AkzProvenanceLevel_Manual, "16-bit linear, no companding -- S3000 manual." },
+        { AkzProvenanceLevel_Manual, "Same L7A1045 silicon as S2000 -- manual-confirmed resonant SVF." },
+        { AkzProvenanceLevel_Manual, "Zero-order hold, same voice chip as S2000, MAME-confirmed." },
+        { AkzProvenanceLevel_Manual, "CYCLIC/INTELLIGENT modes, zone select -- S3000 manual." },
+        { AkzProvenanceLevel_Unmodelled, "DAC back end (zero-order hold + reconstruction filter) not yet implemented -- heritage-roster plan stage 5." },
+    },
+    // AkzMachine_S3200
+    {
+        { AkzProvenanceLevel_Unmodelled, "Fixed-rate machine (22050/44100 Hz); ADC/DAC front/back end not yet implemented -- heritage-roster plan stages 4/5." },
+        { AkzProvenanceLevel_Inferred, "18-bit converters on individual outs, but stored data remains 16-bit -- manual states the converter spec; how that interacts with storage is this project's reading." },
+        { AkzProvenanceLevel_Inferred, "Primary L7A1045 filter manual-confirmed; the optional 2nd digital filter (L7A0986 DFL) giving 24dB/oct \"Moog-ish\" mode is a manual-cited feature whose exact combination this project infers." },
+        { AkzProvenanceLevel_Manual, "Zero-order hold, same voice chip family, MAME-confirmed." },
+        { AkzProvenanceLevel_Manual, "CYCLIC/INTELLIGENT modes, zone select -- S3200 manual." },
+        { AkzProvenanceLevel_Unmodelled, "DAC back end (zero-order hold + reconstruction filter) not yet implemented -- heritage-roster plan stage 5." },
     },
 };
 
@@ -153,6 +247,18 @@ const AkzMachineProfile& machineProfile(AkzMachine machine) {
     return kProfiles[index];
 }
 
+const AkzStageProvenance& stageProvenance(AkzMachine machine, AkzStage stage) {
+    int machineIndex = static_cast<int>(machine);
+    if (machineIndex < 0 || machineIndex >= static_cast<int>(AkzMachine_Count)) {
+        machineIndex = static_cast<int>(AkzMachine_S950);
+    }
+    int stageIndex = static_cast<int>(stage);
+    if (stageIndex < 0 || stageIndex >= static_cast<int>(AkzStage_Count)) {
+        stageIndex = static_cast<int>(AkzStage_Filter); // sane fallback, never reached in practice
+    }
+    return kProvenance[machineIndex][stageIndex];
+}
+
 } // namespace akz
 
 // ---------------------------------------------------------------------------
@@ -161,4 +267,8 @@ const AkzMachineProfile& machineProfile(AkzMachine machine) {
 
 const AkzMachineProfile* akz_machine_profile(AkzMachine machine) {
     return &akz::machineProfile(machine);
+}
+
+const AkzStageProvenance* akz_machine_stage_provenance(AkzMachine machine, AkzStage stage) {
+    return &akz::stageProvenance(machine, stage);
 }

@@ -7,11 +7,25 @@
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
 #include <vector>
 
 namespace akz {
 
 namespace {
+
+// Common interface every filter topology implements, so applyFilter()
+// below can run N stages of whatever topology the profile names without
+// knowing which concrete class it got -- the factory (makeFilterStage,
+// below the two classes) is what turns AkzFilterTopology into one of
+// these. Adding a topology (SsmLadder, CemStateVariable,
+// SwitchedCapacitor -- see AkaizerCore.h) means one new class and one
+// new factory case, never a change to applyFilter's dispatch itself.
+class IFilterStage {
+public:
+    virtual ~IFilterStage() = default;
+    virtual float process(float x) = 0;
+};
 
 // Logarithmic 20 Hz..Nyquist mapping so the cutoff control feels even
 // across its range (matches how a synth filter knob is normally scaled,
@@ -34,7 +48,7 @@ double _mapCutoff01ToHz(float cutoff01, double sampleRateHz) {
 // clock feedthrough -- plan section 3.3), so chasing textbook-exact
 // Butterworth coefficients here would be precision spent modelling a
 // shape the real hardware didn't actually have either.
-class OnePoleLowpassCascade {
+class OnePoleLowpassCascade : public IFilterStage {
 public:
     OnePoleLowpassCascade(int poles, double cutoffHz, double sampleRateHz)
         : _poles(std::max(1, poles)) {
@@ -43,7 +57,7 @@ public:
         _state.assign(static_cast<size_t>(_poles), 0.0);
     }
 
-    float process(float x) {
+    float process(float x) override {
         double v = static_cast<double>(x);
         for (int i = 0; i < _poles; ++i) {
             _state[static_cast<size_t>(i)] += _a * (v - _state[static_cast<size_t>(i)]);
@@ -63,7 +77,7 @@ private:
 // FilterModel.h. Implemented against the code, not its comment: damping
 // bottoms out at 1/16, so resonanceCode 15 approaches but never reaches
 // self-oscillation.
-class ChamberlinSVF {
+class ChamberlinSVF : public IFilterStage {
 public:
     ChamberlinSVF(double cutoffHz, int resonanceCode, double sampleRateHz) {
         // Stability note, corrected: the naive (non-zero-delay-feedback)
@@ -92,7 +106,7 @@ public:
         _damping = 1.0 - static_cast<double>(clampedRes) / 16.0; // bottoms out at 1/16, never 0
     }
 
-    float process(float x) {
+    float process(float x) override {
         const double h = static_cast<double>(x) - _low - _damping * _band;
         _band += _k * h;
         _low += _k * _band;
@@ -117,6 +131,27 @@ private:
     double _band = 0.0;
 };
 
+// Instantiates one stage of `topology`. `poles` is only meaningful for
+// OnePoleCascade (each other topology's pole count is a property of the
+// real chip, not a per-call parameter); `resonanceCode` is only
+// meaningful for the resonant topologies. Passing the irrelevant
+// argument for a given topology is harmless -- the constructor that
+// ignores it just ignores it.
+std::unique_ptr<IFilterStage> makeFilterStage(AkzFilterTopology topology, double cutoffHz, int resonanceCode, double sampleRateHz, int poles) {
+    switch (topology) {
+        case AkzFilterTopology_ChamberlinSvf:
+            return std::make_unique<ChamberlinSVF>(cutoffHz, resonanceCode, sampleRateHz);
+        case AkzFilterTopology_OnePoleCascade:
+        // TptSvf/SsmLadder/CemStateVariable/SwitchedCapacitor land with
+        // the machines that need them (heritage-roster plan stages 6,
+        // 10) -- falling through to OnePoleCascade rather than silently
+        // misrendering is a deliberate placeholder, not a real choice
+        // for any of those topologies' actual character.
+        default:
+            return std::make_unique<OnePoleLowpassCascade>(poles, cutoffHz, sampleRateHz);
+    }
+}
+
 } // namespace
 
 void applyFilter(float* buffer, size_t count, AkzMachine machine, float cutoff01, float resonance01, double sampleRateHz, double transposeRatio) {
@@ -125,31 +160,26 @@ void applyFilter(float* buffer, size_t count, AkzMachine machine, float cutoff01
     const AkzMachineProfile& profile = machineProfile(machine);
     const double trackedRatio = profile.filterTracksPitch ? transposeRatio : 1.0;
     const double cutoffHz = _mapCutoff01ToHz(cutoff01, sampleRateHz) * trackedRatio;
+    const int resonanceCode = static_cast<int>(std::lround(std::max(0.0f, std::min(1.0f, resonance01)) * 15.0f));
+    const int poles = std::max(1, static_cast<int>(std::lround(profile.filterSlopeDbPerOctave / 6.0)));
 
-    if (profile.filterHasResonance) {
-        const int resonanceCode = static_cast<int>(std::lround(std::max(0.0f, std::min(1.0f, resonance01)) * 15.0f));
-        ChamberlinSVF stage1(cutoffHz, resonanceCode, sampleRateHz);
-        // S3200's optional second digital filter, both stages set to
-        // lowpass in series -> 24 dB/oct "Moog-ish" mode (plan section
-        // 3.4). Only S3200 has filterSlopeDbPerOctave == 24 among the
-        // resonant machines.
-        const bool hasSecondStage = profile.filterSlopeDbPerOctave >= 24.0;
-        if (hasSecondStage) {
-            ChamberlinSVF stage2(cutoffHz, resonanceCode, sampleRateHz);
-            for (size_t i = 0; i < count; ++i) {
-                buffer[i] = stage2.process(stage1.process(buffer[i]));
-            }
-        } else {
-            for (size_t i = 0; i < count; ++i) {
-                buffer[i] = stage1.process(buffer[i]);
-            }
+    // filterStageCount replaces the old ">= 24.0 dB/oct" heuristic for
+    // S3200's second series SVF stage -- see AkaizerCore.h. Generalises
+    // for free to any future machine needing N stages of the same
+    // topology in series, not just "one or two."
+    const int stageCount = std::max(1, profile.filterStageCount);
+    std::vector<std::unique_ptr<IFilterStage>> stages;
+    stages.reserve(static_cast<size_t>(stageCount));
+    for (int i = 0; i < stageCount; ++i) {
+        stages.push_back(makeFilterStage(profile.filterTopology, cutoffHz, resonanceCode, sampleRateHz, poles));
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        float v = buffer[i];
+        for (auto& stage : stages) {
+            v = stage->process(v);
         }
-    } else {
-        const int poles = std::max(1, static_cast<int>(std::lround(profile.filterSlopeDbPerOctave / 6.0)));
-        OnePoleLowpassCascade cascade(poles, cutoffHz, sampleRateHz);
-        for (size_t i = 0; i < count; ++i) {
-            buffer[i] = cascade.process(buffer[i]);
-        }
+        buffer[i] = v;
     }
 }
 
