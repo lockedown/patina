@@ -72,6 +72,21 @@ void holdAtRate(float* buffer, size_t count, double targetRateHz, double hostSam
     }
 }
 
+// Builds the converter spec applyRecordPath quantises with, from the
+// profile's plain capability fields -- ConverterModel.h stays exactly
+// as machine-unaware as it was pre-v2; this is the one place an
+// AkzMachine's converter character crosses into a ConverterSpec.
+// profile.companded is a bool-ish int (v1's shape, unchanged): today it
+// means MuLaw when set, since that is the only companding law any
+// researched heritage machine (the Emulator II) needs -- see
+// ConverterModel.h's Companding doc comment.
+ConverterSpec converterSpecForMachine(const AkzMachineProfile& profile) {
+    ConverterSpec spec;
+    spec.bits = profile.bitDepth;
+    spec.companding = profile.companded ? Companding::MuLaw : Companding::None;
+    return spec;
+}
+
 } // namespace
 
 double resolveSampleRateHz(AkzMachine machine, float requestedSampleRateHz, double hostSampleRateHz) {
@@ -88,12 +103,14 @@ void applyRecordPath(float* buffer, size_t count, AkzMachine machine, double eff
 
     const AkzMachineProfile& profile = machineProfile(machine);
 
+    const ConverterSpec converterSpec = converterSpecForMachine(profile);
+
     if (effectiveRateHz <= 0.0 || effectiveRateHz >= hostSampleRateHz) {
         // Already at (or above) host rate -- nothing to decimate, and no
         // anti-alias filtering either: a machine running at its own
         // native/host rate should sound identical to before this stage
         // existed, not pick up an incidental low-pass "for free."
-        quantizeBuffer(buffer, count, profile.bitDepth);
+        quantizeBuffer(buffer, count, converterSpec);
         return;
     }
 
@@ -114,12 +131,13 @@ void applyRecordPath(float* buffer, size_t count, AkzMachine machine, double eff
     // comment for why this is length-neutral by construction.
     holdAtRate(buffer, count, effectiveRateHz, hostSampleRateHz);
 
-    // Bit-depth quantise the now rate-limited signal last -- sample rate
-    // and bit depth are independent ADC properties; either order is
+    // Bit-depth (and, if the machine compands, companding) quantise the
+    // now rate-limited signal last -- sample rate and converter
+    // character are independent ADC properties; either order is
     // physically equivalent, this one keeps the rate stage self-
     // contained rather than splitting it around the caller's own
     // quantizeBuffer call the way v1 had it.
-    quantizeBuffer(buffer, count, profile.bitDepth);
+    quantizeBuffer(buffer, count, converterSpec);
 }
 
 void applyDacPath(float* buffer, size_t count, AkzMachine machine, double playbackRateHz, double hostSampleRateHz) {
