@@ -247,7 +247,11 @@ struct ContentView: View {
             HStack(spacing: 8) {
                 Text(machineProfile.displayName)
                     .font(.headline)
-                Text("\(machineProfile.manufacturerName) · \(machineProfile.yearIntroduced)")
+                // String(year), not raw Int interpolation -- Text's
+                // LocalizedStringKey interpolation formats an
+                // interpolated Int with locale grouping by default
+                // ("1,988"), which reads as a quantity, not a year.
+                Text("\(machineProfile.manufacturerName) · \(String(machineProfile.yearIntroduced))")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -491,7 +495,7 @@ struct ContentView: View {
                     .lineLimit(1)
                     .foregroundStyle(isSelected ? Color.primary : Color.secondary)
                 Spacer()
-                Text("\(StretchProcessor.profile(for: machine).yearIntroduced)")
+                Text(String(StretchProcessor.profile(for: machine).yearIntroduced)) // not raw Int interpolation -- see _machineHeader's comment
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
