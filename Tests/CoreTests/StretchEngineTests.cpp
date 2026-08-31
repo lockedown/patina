@@ -10,6 +10,7 @@
 #include "include/AkaizerCore.h"
 #include "../../Sources/Core/ConverterModel.h"
 #include "../../Sources/Core/FilterModel.h"
+#include "../../Sources/Core/StretchEngine.h"
 
 #include <algorithm>
 #include <cmath>
@@ -215,6 +216,102 @@ AKZ_TEST(shortening_below_100_percent_produces_shorter_output) {
     AKZ_CHECK_EQ(len, static_cast<size_t>(4000)); // round(8000*0.5/200)*200
 
     akz_stretch_engine_destroy(engine);
+}
+
+// v2 heritage-roster plan, stage 3: S900 (and every future non-stretch
+// machine) must get ratio 1.0 from the engine itself, not just from the
+// UI disabling the Stretch knob -- see StretchEngine.cpp's comment on
+// why this is defense in depth, not a redundant check.
+AKZ_TEST(non_stretch_machine_ignores_time_factor_percent_even_if_the_caller_sets_one) {
+    AkzStretchEngine* engine = akz_stretch_engine_create(44100.0);
+    auto source = makeSineSource(4000);
+
+    AkzStretchParams params;
+    akz_stretch_params_default(AkzMachine_S900, &params);
+    AKZ_CHECK(akz_machine_profile(AkzMachine_S900)->supportsTimeStretch == 0);
+    // A caller that ignored the UI gate and asked for 200% anyway --
+    // this must not change the output length at all.
+    params.timeFactorPercent = 200.0f;
+    params.cycleLengthSamples = 1000;
+    akz_stretch_engine_set_params(engine, &params);
+    akz_stretch_engine_set_source(engine, source.data(), source.size());
+
+    // supportsTimeStretch == 0 means CLASSIC/CYCLIC at ratio 1.0, which
+    // is the identity in every other test above -- so the whole source
+    // length round-trips exactly, not the 200% length the caller asked
+    // for and not something merely "shorter than 200% would have been."
+    size_t len = akz_stretch_engine_output_length(engine);
+    AKZ_CHECK_EQ(len, source.size());
+
+    akz_stretch_engine_destroy(engine);
+}
+
+AKZ_TEST(non_stretch_machine_output_length_matches_process_before_and_after_calling_process) {
+    // outputLength() mirrors _recompute()'s length arithmetic separately
+    // (it must be callable before process() has ever run) -- this checks
+    // the two clamps agree with each other, not just that either one
+    // individually looks right.
+    AkzStretchEngine* engine = akz_stretch_engine_create(44100.0);
+    auto source = makeSineSource(4000);
+
+    AkzStretchParams params;
+    akz_stretch_params_default(AkzMachine_S900, &params);
+    params.timeFactorPercent = 50.0f;
+    akz_stretch_engine_set_params(engine, &params);
+    akz_stretch_engine_set_source(engine, source.data(), source.size());
+
+    size_t lenBeforeProcess = akz_stretch_engine_output_length(engine);
+    std::vector<float> out(lenBeforeProcess + 64, -1.0f);
+    size_t written = akz_stretch_engine_process(engine, out.data(), out.size());
+    size_t lenAfterProcess = akz_stretch_engine_output_length(engine);
+
+    AKZ_CHECK_EQ(lenBeforeProcess, source.size());
+    AKZ_CHECK_EQ(written, source.size());
+    AKZ_CHECK_EQ(lenAfterProcess, written);
+
+    akz_stretch_engine_destroy(engine);
+}
+
+// v2 heritage-roster plan, stage 3: paramsDifferOnlyInFilter's rewrite
+// (copy-and-zero-the-filter-fields-then-memcmp) must cover every field,
+// including ones added after the function was first written --
+// sampleRateHz specifically, since it's the whole reason for the
+// rewrite (the old hand-enumerated version would have silently ignored
+// it and taken the cheap filter-only path on a rate change).
+AKZ_TEST(params_differing_only_in_sample_rate_do_not_count_as_filter_only) {
+    AkzStretchParams a;
+    akz_stretch_params_default(AkzMachine_S950, &a);
+    AkzStretchParams b = a;
+    b.sampleRateHz = a.sampleRateHz + 1000.0f;
+
+    // Not a filter-only difference at all (filter fields are identical),
+    // so this must return false, same as "nothing changed."
+    AKZ_CHECK(akz::StretchEngine::paramsDifferOnlyInFilter(a, b) == false);
+
+    // Now combine a real filter change WITH the rate change: the
+    // pre-rewrite hand-enumerated comparison never looked at
+    // sampleRateHz at all, so it would have wrongly reported "filter
+    // only" here. The rewrite must not.
+    b.filterCutoff01 = a.filterCutoff01 + 0.1f;
+    AKZ_CHECK(akz::StretchEngine::paramsDifferOnlyInFilter(a, b) == false);
+}
+
+AKZ_TEST(params_differing_only_in_filter_fields_still_reports_filter_only) {
+    // The rewrite must not have broken the case it exists to detect.
+    AkzStretchParams a;
+    akz_stretch_params_default(AkzMachine_S2000, &a);
+    AkzStretchParams b = a;
+    b.filterCutoff01 = 0.3f;
+    b.filterResonance01 = 0.7f;
+
+    AKZ_CHECK(akz::StretchEngine::paramsDifferOnlyInFilter(a, b) == true);
+}
+
+AKZ_TEST(identical_params_are_not_filter_only) {
+    AkzStretchParams a;
+    akz_stretch_params_default(AkzMachine_S1000, &a);
+    AkzStretchParams b = a;
+    AKZ_CHECK(akz::StretchEngine::paramsDifferOnlyInFilter(a, b) == false);
 }
 
 AKZ_TEST(reset_clears_source_and_output) {

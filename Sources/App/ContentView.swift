@@ -51,6 +51,10 @@ struct ContentView: View {
     @State private var transposeSemitones: Double = 0
     @State private var filterCutoff: Double = 1.0
     @State private var filterResonance: Double = 0.0
+    /// 0 = machine default. No UI control sets this yet -- heritage-
+    /// roster plan stages 4/9 add the bandwidth knob; wired through the
+    /// snapshot/undo/preset machinery now so that lands additively.
+    @State private var sampleRateHz: Double = 0
     @State private var processedChannels: [[Float]]?
 
     @State private var isLiveAuditionOn = false
@@ -844,15 +848,17 @@ struct ContentView: View {
 
     // -- stretch actions -----------------------------------------------------
 
-    /// Reads the ten parameter @State vars into one comparable/undoable
-    /// value. The single place both _currentParams() and every bulk-write
-    /// path (undo, revert, preset apply) read from or compare against.
+    /// Reads the eleven parameter @State vars into one comparable/
+    /// undoable value. The single place both _currentParams() and every
+    /// bulk-write path (undo, revert, preset apply) read from or compare
+    /// against.
     private func _snapshot() -> ParamSnapshot {
         ParamSnapshot(
             machine: selectedMachine, engine: selectedEngine, mode: selectedMode,
             stretchPercent: stretchPercent, cycleLength: cycleLength,
             quality: quality, width: width, transposeSemitones: transposeSemitones,
-            filterCutoff: filterCutoff, filterResonance: filterResonance
+            filterCutoff: filterCutoff, filterResonance: filterResonance,
+            sampleRateHz: sampleRateHz
         )
     }
 
@@ -953,6 +959,7 @@ struct ContentView: View {
         transposeSemitones = defaults.transposeSemitones
         filterCutoff = defaults.filterCutoff
         filterResonance = defaults.filterResonance
+        sampleRateHz = defaults.sampleRateHz
         // S950 has no CYCLIC/INTELLIGENT switch at all (Mon1/Pol2
         // instead -- plan section 3.2). Force the picker back to a real
         // state rather than silently ignoring a stale "Intelligent"
@@ -967,11 +974,12 @@ struct ContentView: View {
         }
     }
 
-    /// Assigns all ten params from a snapshot in one shot -- undo restore,
-    /// revert, and preset apply all funnel through this. Assigning
-    /// selectedMachine directly here (never through _selectMachine) is
-    /// what keeps a bulk write from triggering the machine-change reset
-    /// above and clobbering the very values being restored.
+    /// Assigns all eleven params from a snapshot in one shot -- undo
+    /// restore, revert, and preset apply all funnel through this.
+    /// Assigning selectedMachine directly here (never through
+    /// _selectMachine) is what keeps a bulk write from triggering the
+    /// machine-change reset above and clobbering the very values being
+    /// restored.
     private func _applySnapshot(_ s: ParamSnapshot) {
         selectedMachine = s.machine
         selectedEngine = s.engine
@@ -983,6 +991,7 @@ struct ContentView: View {
         transposeSemitones = s.transposeSemitones
         filterCutoff = s.filterCutoff
         filterResonance = s.filterResonance
+        sampleRateHz = s.sampleRateHz
         _pushLiveParamsIfNeeded()
     }
 
@@ -1034,7 +1043,7 @@ struct ContentView: View {
     /// "revert to original" means discarding the *edit state*, not
     /// restoring a file. Keeps the current machine (it's closer to a
     /// document mode than a parameter -- silently jumping to a different
-    /// sampler would be startling) and resets the other nine params to
+    /// sampler would be startling) and resets the other ten params to
     /// that machine's defaults, then discards the render. One undo step;
     /// undoing it restores the params but not the discarded render --
     /// that's the honest consequence of undo covering parameters only,

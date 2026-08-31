@@ -62,7 +62,8 @@ public final class StretchProcessor {
         var params = AkzStretchParams(
             machine: machine, engine: AkzEngine_Classic, mode: AkzStretchMode_Cyclic,
             timeFactorPercent: 100, cycleLengthSamples: 1000, quality: 10, width: 10,
-            transposeSemitones: 0, filterCutoff01: 1, filterResonance01: 0
+            transposeSemitones: 0, filterCutoff01: 1, filterResonance01: 0,
+            sampleRateHz: 0 // 0 = machine default -- see AkaizerCore.h
         )
         akz_stretch_params_default(machine, &params)
         return params

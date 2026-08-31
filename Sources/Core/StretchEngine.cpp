@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <type_traits>
 
 namespace akz {
 
@@ -303,7 +304,18 @@ void StretchEngine::_recompute() {
     quantizeBuffer(_quantizedSource.data(), _quantizedSource.size(), machineProfile(_params.machine).bitDepth);
 
     const int cycleLength = std::max(kMinCycleLength, _params.cycleLengthSamples);
-    const double ratio = static_cast<double>(_params.timeFactorPercent) / 100.0;
+    // Defense in depth, not just a UI gate: a machine whose profile says
+    // it has no time-stretch capability (S900 today; more join it as the
+    // heritage roster grows) gets ratio 1.0 from the engine itself,
+    // regardless of what timeFactorPercent the caller happens to be
+    // holding. ContentView.swift's UI already disables the Stretch knob
+    // for these machines, but that's advisory -- this is what actually
+    // prevents it, the same "belt and suspenders" reasoning as the
+    // maxStretchPercent clamp that fixed the S900 crash (see README's
+    // "Gotchas fixed along the way").
+    const double ratio = machineProfile(_params.machine).supportsTimeStretch
+        ? static_cast<double>(_params.timeFactorPercent) / 100.0
+        : 1.0;
     const double rawOutLen = static_cast<double>(_quantizedSource.size()) * ratio;
 
     if (_quantizedSource.empty()) {
@@ -400,19 +412,61 @@ void StretchEngine::reapplyFilterOnly(const AkzStretchParams& params) {
     _dirty = false;
 }
 
+// Guard rails for the memcmp below, both checked at compile time rather
+// than trusted:
+//
+//   1. standard-layout is what makes memcmp over this type well-defined
+//      in the first place (no vtable, no base classes, nothing the
+//      language is free to lay out however it likes).
+//   2. The explicit per-field size sum catches padding: if it ever falls
+//      short of sizeof(AkzStretchParams), either a new field was added
+//      to the struct but NOT to this list (the exact "forgotten mirror"
+//      this is meant to catch), or a field's size introduced an
+//      alignment gap the memcmp would read as uninitialised bytes. Every
+//      field today is 4 bytes (enums, int32, float) specifically so the
+//      struct stays gap-free; a differently-sized field needs this
+//      approach revisited, not just extended.
+//   3. The literal size check is a blunter trip-wire: any struct-size
+//      change at all, for any reason, must not go unnoticed. Bump N,
+//      then update the four mirrors named below in the same commit.
+static_assert(std::is_standard_layout<AkzStretchParams>::value,
+    "AkzStretchParams must stay standard-layout for paramsDifferOnlyInFilter's memcmp to be well-defined.");
+static_assert(
+    sizeof(AkzStretchParams::machine) + sizeof(AkzStretchParams::engine) + sizeof(AkzStretchParams::mode) +
+    sizeof(AkzStretchParams::timeFactorPercent) + sizeof(AkzStretchParams::cycleLengthSamples) +
+    sizeof(AkzStretchParams::quality) + sizeof(AkzStretchParams::width) +
+    sizeof(AkzStretchParams::transposeSemitones) +
+    sizeof(AkzStretchParams::filterCutoff01) + sizeof(AkzStretchParams::filterResonance01) +
+    sizeof(AkzStretchParams::sampleRateHz)
+    == sizeof(AkzStretchParams),
+    "AkzStretchParams has a field this sum doesn't account for (or padding), so paramsDifferOnlyInFilter's "
+    "memcmp would compare uninitialised bytes. If you added a field: add it to this sum AND to the "
+    "sizeof(AkzStretchParams) == N check below.");
+static_assert(sizeof(AkzStretchParams) == 44,
+    "AkzStretchParams changed size -- update, in the same commit: akz_stretch_params_default (below), "
+    "the per-field sum static_assert above, StretchBridge.swift's positional AkzStretchParams init "
+    "(intentionally positional so this is a compile error there too), ParamSnapshot.swift, and "
+    "PresetStore.swift's decodeIfPresent handling for the new field.");
+
 bool StretchEngine::paramsDifferOnlyInFilter(const AkzStretchParams& a, const AkzStretchParams& b) {
     const bool filterFieldsDiffer = a.filterCutoff01 != b.filterCutoff01 || a.filterResonance01 != b.filterResonance01;
     if (!filterFieldsDiffer) {
         return false; // identical, or nothing filter-related changed -- caller has nothing to special-case
     }
-    return a.machine == b.machine
-        && a.engine == b.engine
-        && a.mode == b.mode
-        && a.timeFactorPercent == b.timeFactorPercent
-        && a.cycleLengthSamples == b.cycleLengthSamples
-        && a.quality == b.quality
-        && a.width == b.width
-        && a.transposeSemitones == b.transposeSemitones;
+
+    // Copy-and-zero-the-filter-fields-then-memcmp, rather than the old
+    // hand-enumerated field-by-field comparison: every OTHER field is
+    // automatically covered, including ones added after this was
+    // written (sampleRateHz, and whatever stage 4/7 add), instead of
+    // silently taking the filter-only cheap path for a change this
+    // function was never updated to know about.
+    AkzStretchParams aWithoutFilter = a;
+    AkzStretchParams bWithoutFilter = b;
+    aWithoutFilter.filterCutoff01 = 0.0f;
+    aWithoutFilter.filterResonance01 = 0.0f;
+    bWithoutFilter.filterCutoff01 = 0.0f;
+    bWithoutFilter.filterResonance01 = 0.0f;
+    return std::memcmp(&aWithoutFilter, &bWithoutFilter, sizeof(AkzStretchParams)) == 0;
 }
 
 size_t StretchEngine::process(float* outFrames, size_t maxOutFrames) {
@@ -438,7 +492,12 @@ size_t StretchEngine::outputLength() const {
             return 0;
         }
         const int cycleLength = std::max(kMinCycleLength, _params.cycleLengthSamples);
-        const double ratio = static_cast<double>(_params.timeFactorPercent) / 100.0;
+        // Mirrors _recompute()'s same defense-in-depth clamp -- see the
+        // comment there. Must stay identical or outputLength() (callable
+        // before process() has ever run) and the actual render disagree.
+        const double ratio = machineProfile(_params.machine).supportsTimeStretch
+            ? static_cast<double>(_params.timeFactorPercent) / 100.0
+            : 1.0;
         const double rawOutLen = static_cast<double>(_source.size()) * ratio;
         const AkzStretchMode effectiveMode = machineProfile(_params.machine).hasModeSwitch
             ? _params.mode
@@ -490,6 +549,7 @@ void akz_stretch_params_default(AkzMachine machine, AkzStretchParams* out_params
     out_params->transposeSemitones = 0.0f;
     out_params->filterCutoff01 = 1.0f;   // fully open -- matches the hardware's own "0xffff = Nyquist" default
     out_params->filterResonance01 = 0.0f;
+    out_params->sampleRateHz = 0.0f;     // 0 = machine default -- see AkaizerCore.h
 }
 
 AkzStretchEngine* akz_stretch_engine_create(double sampleRateHz) {

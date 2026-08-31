@@ -70,6 +70,11 @@ public struct AkaizerPreset: Codable, Identifiable, Equatable {
     private var transposeSemitones: Float
     private var filterCutoff01: Float
     private var filterResonance01: Float
+    /// 0 = machine default. Added in the same v2 format as machineId,
+    /// but decoded with decodeIfPresent below regardless -- demonstrating
+    /// the whole point of the hand-written Codable: this is additive,
+    /// not a reason to bump formatVersion again.
+    private var sampleRateHz: Float
 
     public init(name: String, params: AkzStretchParams) {
         self.name = name
@@ -84,6 +89,7 @@ public struct AkaizerPreset: Codable, Identifiable, Equatable {
         transposeSemitones = params.transposeSemitones
         filterCutoff01 = params.filterCutoff01
         filterResonance01 = params.filterResonance01
+        sampleRateHz = params.sampleRateHz
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -92,6 +98,7 @@ public struct AkaizerPreset: Codable, Identifiable, Equatable {
         case engineRawValue, modeRawValue
         case timeFactorPercent, cycleLengthSamples, quality, width
         case transposeSemitones, filterCutoff01, filterResonance01
+        case sampleRateHz // absent from every pre-sampleRateHz v2 file; decodeIfPresent below
     }
 
     /// Hand-written rather than synthesised specifically so `machineId`
@@ -124,6 +131,7 @@ public struct AkaizerPreset: Codable, Identifiable, Equatable {
         transposeSemitones = try c.decode(Float.self, forKey: .transposeSemitones)
         filterCutoff01 = try c.decode(Float.self, forKey: .filterCutoff01)
         filterResonance01 = try c.decode(Float.self, forKey: .filterResonance01)
+        sampleRateHz = try c.decodeIfPresent(Float.self, forKey: .sampleRateHz) ?? 0
     }
 
     /// Always writes the current format -- a v1 file loaded and re-saved
@@ -143,6 +151,7 @@ public struct AkaizerPreset: Codable, Identifiable, Equatable {
         try c.encode(transposeSemitones, forKey: .transposeSemitones)
         try c.encode(filterCutoff01, forKey: .filterCutoff01)
         try c.encode(filterResonance01, forKey: .filterResonance01)
+        try c.encode(sampleRateHz, forKey: .sampleRateHz)
     }
 
     /// Reconstructs full params. `StretchProcessor.machine(forStableId:)`
@@ -161,7 +170,8 @@ public struct AkaizerPreset: Codable, Identifiable, Equatable {
             width: width,
             transposeSemitones: transposeSemitones,
             filterCutoff01: filterCutoff01,
-            filterResonance01: filterResonance01
+            filterResonance01: filterResonance01,
+            sampleRateHz: sampleRateHz
         )
     }
 }

@@ -76,6 +76,51 @@ final class PresetStoreTests: XCTestCase {
         XCTAssertEqual(loaded[0].name, "Dusty S1000")
     }
 
+    func testSampleRateHzRoundTrips() {
+        var params = StretchProcessor.defaultParams(machine: AkzMachine_S950)
+        params.sampleRateHz = 26040 // SP-1200's fixed rate, once that machine exists -- exercising the field now
+        let store = makeTempStore()
+        store.save([AkaizerPreset(name: "Rate test", params: params)])
+
+        let loaded = store.loadOrRecover().presets
+        XCTAssertEqual(loaded[0].params.sampleRateHz, 26040, accuracy: 1e-3)
+    }
+
+    /// A v2-format file saved BEFORE sampleRateHz existed (machineId
+    /// present, but no sampleRateHz key at all) must still decode --
+    /// this is what proves the field really is additive, not a v3 in
+    /// disguise. Distinct from the v1 fixture above, which also lacks
+    /// machineId.
+    func testPreSampleRateHzV2FileDecodesWithMachineDefaultRate() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let store = PresetStore(baseDirectory: dir)
+        let fileURL = dir.appendingPathComponent("Patina", isDirectory: true).appendingPathComponent("presets.json")
+        let json = """
+        [
+            {
+                "name": "Pre-rate preset",
+                "formatVersion": 2,
+                "machineId": "akai.s2000",
+                "engineRawValue": 0,
+                "modeRawValue": 0,
+                "timeFactorPercent": 100,
+                "cycleLengthSamples": 1340,
+                "quality": 10,
+                "width": 10,
+                "transposeSemitones": 0,
+                "filterCutoff01": 1,
+                "filterResonance01": 0
+            }
+        ]
+        """
+        try json.write(to: fileURL, atomically: true, encoding: .utf8)
+
+        let (loaded, error) = store.loadOrRecover()
+        XCTAssertNil(error)
+        XCTAssertEqual(loaded.count, 1)
+        XCTAssertEqual(loaded[0].params.sampleRateHz, 0) // 0 = machine default, the documented sentinel
+    }
+
     func testMultiplePresetsPreserveOrder() {
         let store = makeTempStore()
         let params = StretchProcessor.defaultParams(machine: AkzMachine_S950)

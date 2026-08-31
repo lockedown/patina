@@ -18,7 +18,8 @@ final class ParamSnapshotTests: XCTestCase {
         ParamSnapshot(
             machine: AkzMachine_S3200, engine: AkzEngine_Revised, mode: AkzStretchMode_Intelligent,
             stretchPercent: 150, cycleLength: 750, quality: 42, width: 17,
-            transposeSemitones: -5.5, filterCutoff: 0.75, filterResonance: 0.25
+            transposeSemitones: -5.5, filterCutoff: 0.75, filterResonance: 0.25,
+            sampleRateHz: 26040
         )
     }
 
@@ -65,6 +66,9 @@ final class ParamSnapshotTests: XCTestCase {
 
         var resonance = base; resonance.filterResonance += 0.01
         XCTAssertNotEqual(resonance, base)
+
+        var rate = base; rate.sampleRateHz += 100
+        XCTAssertNotEqual(rate, base)
 
         XCTAssertEqual(base, base) // and an identical copy still matches
     }

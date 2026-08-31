@@ -202,6 +202,19 @@ typedef struct AkzStretchParams {
     // (AkzMachineProfile.filterHasResonance == 0) -- see FilterModel.h.
     float filterCutoff01;
     float filterResonance01;
+
+    // Sample rate / bandwidth front end (heritage-roster plan v2, stage
+    // 3 schema -- the RateModel DSP itself lands in stage 4). 0.0 means
+    // "use the machine's own default" (profile.maxSampleRateHz for a
+    // fixed-rate machine; the manual-documented default bandwidth for a
+    // variable-rate one, e.g. the S950's own top bandwidth), resolved by
+    // whatever consumes this field rather than requiring every caller to
+    // already know the machine's range. A non-zero value is silently
+    // clamped into [minSampleRateHz, maxSampleRateHz] by that same
+    // resolution step. Appended (not inserted) so every existing
+    // AkzStretchParams literal in Swift keeps compiling positionally --
+    // see StretchBridge.swift.
+    float sampleRateHz;
 } AkzStretchParams;
 
 // Fills params with the machine's documented defaults.
