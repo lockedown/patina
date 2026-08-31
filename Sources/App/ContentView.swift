@@ -115,6 +115,10 @@ struct ContentView: View {
     /// own examples. Persisted via PresetStore, loaded once on launch.
     @State private var presets: [AkaizerPreset] = []
 
+    /// Filters the sidebar's MACHINES section (v2 heritage-roster plan,
+    /// stage 9) -- only shown once the roster is long enough to need it.
+    @State private var machineSearchText: String = ""
+
     /// Mono (channel 0) traces for WaveformView. Decoded once per load/
     /// process rather than in the view body, so scrolling/resizing the
     /// window doesn't re-decode a whole file's worth of PCM every frame.
@@ -202,7 +206,109 @@ struct ContentView: View {
         }
         rows.append(filterFields)
 
+        // Bandwidth (v2 heritage-roster plan, stage 4/9) -- only on a
+        // machine whose sample rate is genuinely a knob, not a fixed
+        // spec. sampleRateHz == 0 (the RateModel.h sentinel) reads as
+        // "fully open," matching the filter cutoff's own 0xffff/Nyquist
+        // convention, rather than showing a literal 0hz.
+        if machineProfile.hasVariableSampleRate != 0 {
+            let displayHz = sampleRateHz > 0 ? sampleRateHz : machineProfile.maxSampleRateHz
+            rows.append([LCDField("rate", "\(Int(displayHz))hz")])
+        }
+
+        if _inferredStageCount > 0 {
+            rows.append([LCDField("modelled", "\(_citedStageCount) cited · \(_inferredStageCount) inferred")])
+        }
+
         return rows
+    }
+
+    // -- provenance (v2 heritage-roster plan, stage 9) ------------------------
+
+    /// Stages whose provenance for the current machine is Inferred or
+    /// Unmodelled -- the "must be visible in the UI" half of v2's
+    /// fidelity bar (citation-first, inference allowed only if flagged).
+    private var _inferredStageCount: Int {
+        StretchProcessor.allStages.filter {
+            let level = StretchProcessor.provenance(for: selectedMachine, stage: $0).level
+            return level == AkzProvenanceLevel_Inferred || level == AkzProvenanceLevel_Unmodelled
+        }.count
+    }
+
+    private var _citedStageCount: Int {
+        StretchProcessor.allStages.count - _inferredStageCount
+    }
+
+    /// Read-only machine identity + capability chips + the "Modelled
+    /// from..." provenance panel. Replaces the Machine Picker that used
+    /// to live here -- selection itself moved to the sidebar.
+    private var _machineHeader: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text(machineProfile.displayName)
+                    .font(.headline)
+                Text("\(machineProfile.manufacturerName) · \(machineProfile.yearIntroduced)")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if _stretchIsSupported {
+                    _capabilityChip("Stretch")
+                }
+                if _filterHasResonance {
+                    _capabilityChip("Resonance")
+                }
+                if machineProfile.hasVariableSampleRate != 0 {
+                    _capabilityChip("Bandwidth")
+                }
+            }
+
+            DisclosureGroup("Modelled from…") {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(StretchProcessor.allStages, id: \.rawValue) { stage in
+                        _provenanceRow(stage)
+                    }
+                }
+                .padding(.top, 4)
+            }
+            .font(.caption)
+        }
+    }
+
+    private func _capabilityChip(_ text: String) -> some View {
+        Text(text)
+            .font(.caption2.weight(.medium))
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Color.accentColor.opacity(0.15), in: Capsule())
+            .foregroundStyle(Color.accentColor)
+    }
+
+    private func _provenanceRow(_ stage: AkzStage) -> some View {
+        let (level, note) = StretchProcessor.provenance(for: selectedMachine, stage: stage)
+        let isInferred = level == AkzProvenanceLevel_Inferred || level == AkzProvenanceLevel_Unmodelled
+        return HStack(alignment: .top, spacing: 6) {
+            Text(_provenanceBadge(level))
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(isInferred ? .orange : .secondary)
+                .frame(width: 60, alignment: .leading)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(StretchProcessor.label(for: stage))
+                    .font(.caption.weight(.medium))
+                Text(note)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func _provenanceBadge(_ level: AkzProvenanceLevel) -> String {
+        switch level {
+        case AkzProvenanceLevel_Measured: return "MEASURED"
+        case AkzProvenanceLevel_Manual: return "CITED"
+        case AkzProvenanceLevel_Inferred: return "INFERRED"
+        case AkzProvenanceLevel_Unmodelled: return "N/A"
+        default: return "?"
+        }
     }
 
     var body: some View {
@@ -270,8 +376,63 @@ struct ContentView: View {
 
     // -- layout --------------------------------------------------------------
 
+    /// Machines filtered by `machineSearchText`, grouped by manufacturer
+    /// -- v2 heritage-roster plan, stage 9: replaces the flat Machine
+    /// Picker once the roster grows past six. Groups are ordered by
+    /// each manufacturer's first appearance in
+    /// StretchProcessor.allMachines (itself AkzMachine's declaration
+    /// order), not alphabetically -- Akai first, matching the app's own
+    /// history.
+    private var _groupedMachines: [(manufacturer: String, machines: [AkzMachine])] {
+        let filtered = StretchProcessor.allMachines.filter { machine in
+            guard !machineSearchText.isEmpty else { return true }
+            let profile = StretchProcessor.profile(for: machine)
+            return profile.displayName.localizedCaseInsensitiveContains(machineSearchText)
+                || profile.manufacturerName.localizedCaseInsensitiveContains(machineSearchText)
+        }
+        var order: [String] = []
+        var groups: [String: [AkzMachine]] = [:]
+        for machine in filtered {
+            let manufacturer = StretchProcessor.profile(for: machine).manufacturerName
+            if groups[manufacturer] == nil { order.append(manufacturer) }
+            groups[manufacturer, default: []].append(machine)
+        }
+        return order.map { (manufacturer: $0, machines: groups[$0] ?? []) }
+    }
+
     private var _sidebar: some View {
+        ScrollView {
         VStack(alignment: .leading, spacing: 2) {
+            Text("MACHINES")
+                .font(.caption.weight(.semibold))
+                .tracking(1.0)
+                .foregroundStyle(.secondary)
+                .padding(.top, 16)
+                .padding(.horizontal, 14)
+                .padding(.bottom, 6)
+
+            // Only worth the pixels once the roster is long enough to
+            // need it -- a fixed threshold rather than always-on, since
+            // six machines fit on screen with room to spare.
+            if StretchProcessor.allMachines.count > 8 {
+                TextField("Filter…", text: $machineSearchText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 4)
+            }
+
+            ForEach(_groupedMachines, id: \.manufacturer) { group in
+                Text(group.manufacturer.uppercased())
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 14)
+                    .padding(.top, 4)
+                ForEach(group.machines, id: \.rawValue) { machine in
+                    _machineRow(machine)
+                }
+            }
+
             Text("RECENT")
                 .font(.caption.weight(.semibold))
                 .tracking(1.0)
@@ -310,11 +471,35 @@ struct ContentView: View {
                 }
             }
 
-            Spacer()
         }
-        .frame(width: 190)
+        .padding(.bottom, 16)
+        }
+        .frame(width: 220)
         .frame(maxHeight: .infinity)
         .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    private func _machineRow(_ machine: AkzMachine) -> some View {
+        let isSelected = machine == selectedMachine
+        return Button(action: { _selectMachine(machine) }) {
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(isSelected ? Color.accentColor : .clear)
+                    .frame(width: 6, height: 6)
+                Text(StretchProcessor.profile(for: machine).displayName)
+                    .font(.callout)
+                    .lineLimit(1)
+                    .foregroundStyle(isSelected ? Color.primary : Color.secondary)
+                Spacer()
+                Text("\(StretchProcessor.profile(for: machine).yearIntroduced)")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 5)
+        }
+        .buttonStyle(.plain)
+        .background(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
     }
 
     private func _presetRow(_ preset: AkaizerPreset) -> some View {
@@ -414,20 +599,26 @@ struct ContentView: View {
 
             GroupBox("Time stretch") {
                 VStack(alignment: .leading, spacing: 10) {
-                    Picker("Machine", selection: Binding(get: { selectedMachine }, set: _selectMachine)) {
-                        ForEach(StretchProcessor.allMachines, id: \.rawValue) { machine in
-                            Text(StretchProcessor.profile(for: machine).displayName).tag(machine)
-                        }
-                    }
-                    .onChange(of: selectedEngine) { _, _ in _pushLiveParamsIfNeeded() }
-                    .onChange(of: selectedMode) { _, _ in _pushLiveParamsIfNeeded() }
-                    .onChange(of: stretchPercent) { _, _ in _pushLiveParamsIfNeeded() }
-                    .onChange(of: cycleLength) { _, _ in _pushLiveParamsIfNeeded() }
-                    .onChange(of: quality) { _, _ in _pushLiveParamsIfNeeded() }
-                    .onChange(of: width) { _, _ in _pushLiveParamsIfNeeded() }
-                    .onChange(of: transposeSemitones) { _, _ in _pushLiveParamsIfNeeded() }
-                    .onChange(of: filterCutoff) { _, _ in _pushLiveParamsIfNeeded() }
-                    .onChange(of: filterResonance) { _, _ in _pushLiveParamsIfNeeded() }
+                    // Machine selection moved to the sidebar's MACHINES
+                    // section (v2 heritage-roster plan, stage 9) once a
+                    // flat Picker stopped scaling past six -- this is
+                    // now a read-only header plus the provenance panel,
+                    // not a second selection surface. The live-param
+                    // push chain (unchanged mechanism -- attaching to
+                    // ANY mounted view in this subtree behaves
+                    // identically) moves here since the Picker it used
+                    // to ride on is gone.
+                    _machineHeader
+                        .onChange(of: selectedEngine) { _, _ in _pushLiveParamsIfNeeded() }
+                        .onChange(of: selectedMode) { _, _ in _pushLiveParamsIfNeeded() }
+                        .onChange(of: stretchPercent) { _, _ in _pushLiveParamsIfNeeded() }
+                        .onChange(of: cycleLength) { _, _ in _pushLiveParamsIfNeeded() }
+                        .onChange(of: quality) { _, _ in _pushLiveParamsIfNeeded() }
+                        .onChange(of: width) { _, _ in _pushLiveParamsIfNeeded() }
+                        .onChange(of: transposeSemitones) { _, _ in _pushLiveParamsIfNeeded() }
+                        .onChange(of: filterCutoff) { _, _ in _pushLiveParamsIfNeeded() }
+                        .onChange(of: filterResonance) { _, _ in _pushLiveParamsIfNeeded() }
+                        .onChange(of: sampleRateHz) { _, _ in _pushLiveParamsIfNeeded() }
 
                     Picker("Engine", selection: _undoableBinding(get: { selectedEngine }, set: { selectedEngine = $0 })) {
                         Text("Classic").tag(AkzEngine_Classic)
@@ -451,108 +642,24 @@ struct ContentView: View {
                     // combinations. ScrollView on the whole pane (below)
                     // is the backstop; a single flat row is the fix that
                     // actually keeps the common case short.
+                    //
+                    // Generated from MachineControls.controls(for:mode:)
+                    // (v2 heritage-roster plan, stage 9) rather than a
+                    // hand-written chain of `if`s -- SP-1200 (Bandwidth +
+                    // Cutoff + Transpose, no stretch cluster at all) and
+                    // S950 (bandwidth AND stretch together) are
+                    // orthogonal axes that used to multiply combinations
+                    // by hand; the descriptor table gets every
+                    // combination right by construction instead.
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(alignment: .top, spacing: 20) {
-                            // Transpose is a basic sampler feature every
-                            // one of these machines has (unlike
-                            // time-stretch, which the S900 lacks -- plan
-                            // section 3.1), so it's shown unconditionally
-                            // rather than gated on _stretchIsSupported.
-                            // Varispeed: pitch and duration move
-                            // together, matching the real hardware -- see
-                            // Interpolator.h.
-                            _knobCell(
-                                "Transpose", value: $transposeSemitones,
-                                range: -36...36, taper: .linear, step: 1,
-                                defaultValue: Double(_defaultParams.transposeSemitones),
-                                format: "%.0f st"
-                            )
-
-                            // Filter (build order stage 6) applies
-                            // regardless of whether the machine supports
-                            // time-stretch -- every one of these machines
-                            // has SOME VCF (plan section 3.1), so cutoff
-                            // is shown unconditionally. Cutoff's own 0..1
-                            // knob stays linear even though it feels
-                            // logarithmic in use -- FilterModel already
-                            // bends it to 20 Hz..Nyquist one layer down,
-                            // so a log taper here would double-bend the
-                            // same curve.
-                            _knobCell(
-                                "Cutoff", value: $filterCutoff,
-                                range: 0...1, taper: .linear, step: nil,
-                                defaultValue: Double(_defaultParams.filterCutoff01),
-                                format: "%.2f"
-                            )
-
-                            // Resonance only does anything on
-                            // S2000/S3000/S3200 (plan section 3.2 item 2
-                            // -- the S2000 correction) so it's hidden
-                            // rather than shown-but-inert elsewhere.
-                            if _filterHasResonance {
+                            ForEach(MachineControls.controls(for: selectedMachine, mode: selectedMode), id: \.id) { descriptor in
                                 _knobCell(
-                                    "Resonance", value: $filterResonance,
-                                    range: 0...1, taper: .linear, step: nil,
-                                    defaultValue: Double(_defaultParams.filterResonance01),
-                                    format: "%.2f"
+                                    descriptor.label, value: _binding(for: descriptor.id),
+                                    range: descriptor.range, taper: descriptor.taper, step: descriptor.step,
+                                    defaultValue: _defaultValue(for: descriptor.id),
+                                    format: descriptor.format
                                 )
-                            }
-
-                            if _stretchIsSupported {
-                                // Stretch spans 25..2000% (25..999 on the
-                                // S950) -- close to two orders of
-                                // magnitude, with the musically useful
-                                // region bunched near 100%. A logarithmic
-                                // taper gives equal knob rotation to
-                                // equal *ratio* change (e.g. 50%->100%
-                                // feels like the same twist as
-                                // 100%->200%), matching how a
-                                // time-stretch amount is actually heard
-                                // -- a linear taper would crowd
-                                // everything below 200% into a sliver of
-                                // the knob's travel.
-                                _knobCell(
-                                    "Stretch", value: $stretchPercent,
-                                    range: 25...max(25.0, Double(machineProfile.maxStretchPercent)),
-                                    taper: .logarithmic, step: 1,
-                                    defaultValue: Double(_defaultParams.timeFactorPercent),
-                                    format: "%.0f%%"
-                                )
-
-                                // Cycle length only means anything in
-                                // CYCLIC; quality/width only in
-                                // INTELLIGENT (plan "2.2", and each
-                                // field's own doc comment in
-                                // AkaizerCore.h) -- shown accordingly
-                                // rather than all-visible-but-some-inert.
-                                if _isIntelligentMode {
-                                    _knobCell(
-                                        "Quality", value: $quality,
-                                        range: 0...99, taper: .linear, step: 1,
-                                        defaultValue: Double(_defaultParams.quality),
-                                        format: "%.0f"
-                                    )
-                                    _knobCell(
-                                        "Width", value: $width,
-                                        range: 0...99, taper: .linear, step: 1,
-                                        defaultValue: Double(_defaultParams.width),
-                                        format: "%.0f"
-                                    )
-                                } else {
-                                    // 20..2000 samples is the same
-                                    // span-of-two-orders-of-magnitude
-                                    // case as Stretch, for the same
-                                    // reason: cycle length is felt/heard
-                                    // as a ratio (an octave of grain
-                                    // length), not a linear sample count,
-                                    // so it gets the same log taper.
-                                    _knobCell(
-                                        "Cycle", value: $cycleLength,
-                                        range: 20...2000, taper: .logarithmic, step: 1,
-                                        defaultValue: Double(_defaultParams.cycleLengthSamples),
-                                        format: "%.0f smp"
-                                    )
-                                }
                             }
 
                             Spacer(minLength: 0)
@@ -653,6 +760,48 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    /// Maps a MachineControls.ParamID to its backing @State var's
+    /// Binding<Double> -- the seam that lets the knob row be generated
+    /// from MachineControls.controls(for:mode:) (stage 9) without a
+    /// SamplerModel view model (see this file's header note on why that
+    /// extraction was skipped): each parameter still lives in its own
+    /// @State var here, this switch is just how a descriptor finds it.
+    private func _binding(for id: ParamID) -> Binding<Double> {
+        switch id {
+        case .transpose: return $transposeSemitones
+        case .bandwidth: return $sampleRateHz
+        case .cutoff: return $filterCutoff
+        case .resonance: return $filterResonance
+        case .stretch: return $stretchPercent
+        case .cycle: return $cycleLength
+        case .quality: return $quality
+        case .width: return $width
+        }
+    }
+
+    /// Double-click-to-reset target for one knob -- the current
+    /// machine's documented default, same principle as every other
+    /// knob's defaultValue. Bandwidth is a deliberate exception:
+    /// AkzStretchParams.sampleRateHz's own default is 0 ("no rate
+    /// stage" -- RateModel.h), which sits BELOW the knob's own
+    /// [minSampleRateHz, maxSampleRateHz] range and would look broken
+    /// as a reset target. maxSampleRateHz resets to the same audible
+    /// no-op behaviour (applyRecordPath's own effectiveRateHz >=
+    /// hostSampleRateHz early-out), just expressed as a value inside
+    /// the visible range instead of the sentinel.
+    private func _defaultValue(for id: ParamID) -> Double? {
+        switch id {
+        case .transpose: return Double(_defaultParams.transposeSemitones)
+        case .bandwidth: return machineProfile.maxSampleRateHz
+        case .cutoff: return Double(_defaultParams.filterCutoff01)
+        case .resonance: return Double(_defaultParams.filterResonance01)
+        case .stretch: return Double(_defaultParams.timeFactorPercent)
+        case .cycle: return Double(_defaultParams.cycleLengthSamples)
+        case .quality: return Double(_defaultParams.quality)
+        case .width: return Double(_defaultParams.width)
+        }
     }
 
     /// One rack-panel knob -- see KnobCell.swift for the view itself.

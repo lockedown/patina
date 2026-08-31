@@ -84,6 +84,12 @@ typedef struct AkzMachineProfile {
     // AkzMachine itself never being renumbered.
     const char* stableId;
 
+    // Roster metadata (v2 heritage-roster plan, stage 9) -- grouping/
+    // sorting for the sidebar's machine browser, once the roster grows
+    // past a flat picker. Display-only; no DSP reads these.
+    const char* manufacturer;  // e.g. "Akai", "E-mu", "Roland", "Fairlight", "Ensoniq"
+    int         yearIntroduced;
+
     // Sample rate. S900/S950 are continuously variable via an audio
     // bandwidth control (fs = bandwidth * 2.5); S1000 and later select
     // between exactly two fixed rates (22050/44100 Hz), captured here as
@@ -173,6 +179,12 @@ typedef struct AkzMachineProfile {
 // Returns the profile for a machine. The returned pointer is to static
 // storage and never needs to be freed.
 const AkzMachineProfile* akz_machine_profile(AkzMachine machine);
+
+// Number of machines in the roster -- AkzMachine_Count, exposed across
+// the C boundary so Swift's StretchProcessor.allMachines can be
+// (0..<akz_machine_count()) rather than a hand-maintained literal array
+// that has to be kept in sync with the enum by hand.
+size_t akz_machine_count(void);
 
 // ---------------------------------------------------------------------------
 // Provenance — is a modelled stage cited, or this project's inference?

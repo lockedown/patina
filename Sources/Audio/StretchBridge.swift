@@ -73,11 +73,12 @@ public final class StretchProcessor {
         akz_machine_profile(machine).pointee
     }
 
-    /// All machines in declaration order, for building a picker.
-    public static let allMachines: [AkzMachine] = [
-        AkzMachine_S900, AkzMachine_S950, AkzMachine_S1000,
-        AkzMachine_S2000, AkzMachine_S3000, AkzMachine_S3200,
-    ]
+    /// All machines in declaration order, for building the roster
+    /// browser. Derived from akz_machine_count() (v2 heritage-roster
+    /// plan, stage 9) rather than a hand-maintained literal array --
+    /// adding a machine to the C enum is now enough on its own; nothing
+    /// on the Swift side has to be kept in sync by hand.
+    public static let allMachines: [AkzMachine] = (0..<akz_machine_count()).map { AkzMachine(rawValue: UInt32($0)) }
 
     /// Reverse lookup for AkzMachineProfile.stableId -- what
     /// AkaizerPreset.machineId stores on disk. Linear scan over six (soon
@@ -91,6 +92,38 @@ public final class StretchProcessor {
             return machine
         }
         return AkzMachine_S950
+    }
+
+    /// The stages provenance is tracked for, in AkzStage's own order --
+    /// what the UI iterates to build a "modelled from..." panel.
+    public static let allStages: [AkzStage] = [
+        AkzStage_Rate, AkzStage_Converter, AkzStage_Filter,
+        AkzStage_Interpolator, AkzStage_Stretch, AkzStage_Dac,
+    ]
+
+    /// Human-readable label for one stage, for provenance UI.
+    public static func label(for stage: AkzStage) -> String {
+        switch stage {
+        case AkzStage_Rate: return "Sample rate"
+        case AkzStage_Converter: return "Converter"
+        case AkzStage_Filter: return "Filter"
+        case AkzStage_Interpolator: return "Interpolator"
+        case AkzStage_Stretch: return "Time-stretch"
+        case AkzStage_Dac: return "DAC"
+        default: return "?"
+        }
+    }
+
+    /// Provenance for one machine/stage pair -- see AkaizerCore.h's
+    /// AkzStageProvenance. Never nil in practice (the C side guarantees
+    /// an entry for every pair, enforced by a completeness test), but
+    /// the pointer is still checked since it crosses the C boundary.
+    public static func provenance(for machine: AkzMachine, stage: AkzStage) -> (level: AkzProvenanceLevel, note: String) {
+        guard let entry = akz_machine_stage_provenance(machine, stage) else {
+            return (AkzProvenanceLevel_Unmodelled, "?")
+        }
+        let note = entry.pointee.note != nil ? String(cString: entry.pointee.note) : "?"
+        return (entry.pointee.level, note)
     }
 }
 
@@ -167,5 +200,11 @@ public extension AkzMachineProfile {
     /// AkaizerPreset.machineId compares against.
     var stableIdString: String {
         stableId != nil ? String(cString: stableId) : "?"
+    }
+
+    /// Same storage/lifetime guarantee as `name` above. Roster-browser
+    /// grouping (v2 heritage-roster plan, stage 9) -- display only.
+    var manufacturerName: String {
+        manufacturer != nil ? String(cString: manufacturer) : "?"
     }
 }

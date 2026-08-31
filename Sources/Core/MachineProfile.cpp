@@ -36,6 +36,8 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
     {
         /* name */                    "S900",
         /* stableId */                "akai.s900",
+        /* manufacturer */            "Akai",
+        /* yearIntroduced */          1986,
         /* minSampleRateHz */         7500.0,
         /* maxSampleRateHz */         40000.0,          // bandwidth 3000-16000 Hz * 2.5 [M]
         /* hasVariableSampleRate */   1,
@@ -62,6 +64,8 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
     {
         /* name */                    "S950",
         /* stableId */                "akai.s950",
+        /* manufacturer */            "Akai",
+        /* yearIntroduced */          1988,
         /* minSampleRateHz */         7500.0,
         /* maxSampleRateHz */         48000.0,          // bandwidth 3000-19200 Hz * 2.5, confirmed 3 ways in manual [M]
         /* hasVariableSampleRate */   1,
@@ -88,6 +92,8 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
     {
         /* name */                    "S1000",
         /* stableId */                "akai.s1000",
+        /* manufacturer */            "Akai",
+        /* yearIntroduced */          1988,
         /* minSampleRateHz */         22050.0,
         /* maxSampleRateHz */         44100.0,          // exactly two rates, no continuous variation [M]
         /* hasVariableSampleRate */   0,
@@ -114,6 +120,8 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
     {
         /* name */                    "S2000",
         /* stableId */                "akai.s2000",
+        /* manufacturer */            "Akai",
+        /* yearIntroduced */          1994,
         /* minSampleRateHz */         22050.0,
         /* maxSampleRateHz */         44100.0,
         /* hasVariableSampleRate */   0,
@@ -140,6 +148,8 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
     {
         /* name */                    "S3000",
         /* stableId */                "akai.s3000",
+        /* manufacturer */            "Akai",
+        /* yearIntroduced */          1994,
         /* minSampleRateHz */         22050.0,
         /* maxSampleRateHz */         44100.0,
         /* hasVariableSampleRate */   0,
@@ -166,6 +176,8 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
     {
         /* name */                    "S3200",
         /* stableId */                "akai.s3200",
+        /* manufacturer */            "Akai",
+        /* yearIntroduced */          1994,
         /* minSampleRateHz */         22050.0,
         /* maxSampleRateHz */         44100.0,
         /* hasVariableSampleRate */   0,
@@ -291,6 +303,10 @@ const AkzStageProvenance& stageProvenance(AkzMachine machine, AkzStage stage) {
 
 const AkzMachineProfile* akz_machine_profile(AkzMachine machine) {
     return &akz::machineProfile(machine);
+}
+
+size_t akz_machine_count(void) {
+    return static_cast<size_t>(AkzMachine_Count);
 }
 
 const AkzStageProvenance* akz_machine_stage_provenance(AkzMachine machine, AkzStage stage) {
