@@ -141,6 +141,98 @@ AKZ_TEST(S3200_second_filter_stage_attenuates_more_than_S3000_single_stage) {
     AKZ_CHECK(s3200Rms < s3000Rms);
 }
 
+// -- v2 heritage-roster plan, "TPT SVF" stage: regression tests for the
+// specific bug this migration fixes (ChamberlinSvf's k <= 1.1 clamp
+// capping the real achievable cutoff around 8kHz and leaving an
+// uncompensated resonant peak that could exceed 1.0 and clip
+// downstream through PCMConversion.matchedGain). These would have
+// FAILED against v1/pre-stage-6 ChamberlinSvf -- that's the point.
+
+AKZ_TEST(resonant_machine_cutoff_reaches_above_the_old_8khz_ceiling) {
+    const double sampleRate = 44100.0;
+    // cutoff01 mapped log-20..Nyquist: a 12kHz-ish tone with cutoff set
+    // well above it must pass through largely unattenuated -- impossible
+    // under the old ChamberlinSvf clamp, whose real ceiling was ~8kHz
+    // regardless of how open the cutoff control claimed to be.
+    auto passed = makeSine(4000, 12000.0, sampleRate);
+    auto reference = passed;
+    applyFilter(passed.data(), passed.size(), AkzMachine_S3000, 0.95f, 0.0f, sampleRate, 1.0);
+
+    const double passedRms = rms(passed, 500);
+    const double referenceRms = rms(reference, 500);
+    AKZ_CHECK(passedRms > referenceRms * 0.7); // meaningfully passed through, not still capped near 8kHz
+}
+
+AKZ_TEST(resonant_peak_never_exceeds_unity_at_full_compensation) {
+    // filterResonanceCompensation01 == 1.0 for S2000/S3000/S3200 (full
+    // compensation) -- the whole point of the fix. Sweep cutoff across
+    // the range at maximum resonance and confirm the output peak never
+    // exceeds the input peak, which the old uncompensated clamp could
+    // not guarantee (the original bug report: an 0.8-amplitude 440Hz
+    // tone came out peaking at 1.135).
+    const double sampleRate = 44100.0;
+    const float inputAmplitude = 0.8f;
+    for (float cutoff01 = 0.1f; cutoff01 <= 1.0f; cutoff01 += 0.15f) {
+        auto buf = makeSine(4000, 440.0, sampleRate, inputAmplitude);
+        applyFilter(buf.data(), buf.size(), AkzMachine_S3000, cutoff01, 1.0f, sampleRate, 1.0);
+
+        float peak = 0.0f;
+        for (size_t i = 1000; i < buf.size(); ++i) { // skip startup transient
+            peak = std::max(peak, std::fabs(buf[i]));
+        }
+        AKZ_CHECK(peak <= inputAmplitude * 1.05); // full compensation -- allow a hair of numerical slack, not a real margin
+    }
+}
+
+AKZ_TEST(tpt_svf_stability_sweep_every_resonance_code_stays_finite) {
+    // The sweep that caught ChamberlinSvf's k ~= 1.23 divergence,
+    // repeated against TptSvf: all 16 resonance codes, 200k samples,
+    // must never produce a non-finite value. TptSvf's zero-delay-
+    // feedback structure is unconditionally stable by construction, so
+    // this should trivially pass -- it exists to catch a REGRESSION
+    // (e.g. a future edit reintroducing an unstable coefficient), not
+    // because TptSvf is expected to be fragile the way ChamberlinSvf was.
+    const double sampleRate = 44100.0;
+    const size_t sampleCount = 200000;
+    for (int resonanceCode = 0; resonanceCode <= 15; ++resonanceCode) {
+        auto buf = makeSine(sampleCount, 1000.0, sampleRate, 0.9f);
+        const float resonance01 = static_cast<float>(resonanceCode) / 15.0f;
+        applyFilter(buf.data(), buf.size(), AkzMachine_S2000, 0.9f, resonance01, sampleRate, 1.0);
+        for (float v : buf) {
+            AKZ_CHECK(std::isfinite(v));
+        }
+    }
+}
+
+AKZ_TEST(tpt_svf_dc_gain_matches_the_documented_compensation_formula) {
+    // The raw zero-delay-feedback SVF has unity DC gain for any k > 0 --
+    // but filterResonanceCompensation01 == 1.0 (S2000/S3000/S3200)
+    // deliberately scales the WHOLE signal path (input and output gain
+    // are mathematically equivalent for a linear filter) by
+    // 1 / (1 + c*(peakGain-1)), per FilterModel.cpp's own doc comment --
+    // so full compensation trades away unity DC gain in exchange for
+    // never clipping at the resonant peak, a real design tradeoff, not
+    // a bug. At resonance01 == 0 there is no peak to compensate
+    // (peakGain == 1), so compensation has zero effect regardless of the
+    // profile's setting, and DC gain must be exactly unity.
+    const double sampleRate = 44100.0;
+
+    {
+        std::vector<float> buf(4000, 0.5f);
+        applyFilter(buf.data(), buf.size(), AkzMachine_S3000, 0.5f, 0.0f, sampleRate, 1.0);
+        AKZ_CHECK_NEAR(buf.back(), 0.5, 1e-3);
+    }
+    {
+        // resonanceCode 15 -> damping 1/16 -> k = 0.125 -> peakGain = 8
+        // -> inputScale = 1/(1 + 1.0*(8-1)) = 0.125, matching
+        // AkzMachineProfile.filterResonanceCompensation01 == 1.0 for
+        // S3000 -- see MachineProfile.cpp.
+        std::vector<float> buf(4000, 0.5f);
+        applyFilter(buf.data(), buf.size(), AkzMachine_S3000, 0.5f, 1.0f, sampleRate, 1.0);
+        AKZ_CHECK_NEAR(buf.back(), 0.5 * 0.125, 1e-3);
+    }
+}
+
 AKZ_TEST(non_resonant_machines_have_no_resonance_parameter_effect) {
     // S900/S950/S1000 have no resonance control at all (plan section
     // 3.2 item 2) -- resonance01 must be silently ignored, not produce

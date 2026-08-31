@@ -130,6 +130,17 @@ typedef struct AkzMachineProfile {
     AkzFilterTopology filterTopology; // which class FilterModel.cpp's factory instantiates
     int    filterStageCount;          // stages of filterTopology run in series (2 for S3200's "2nd DIGITAL FILTER" -> 24dB/oct, 1 otherwise)
 
+    // Resonant-peak compensation for AkzFilterTopology_TptSvf (v2
+    // heritage-roster plan, "SVF fix" stage). [I] -- no manual specifies
+    // this; it exists to fix the passband-gain clipping that
+    // ChamberlinSvf's k <= 1.1 stability clamp left behind. 0 = no
+    // compensation (the resonant peak, a real and kept characteristic,
+    // passes through at full height, closer to hardware that itself
+    // gets louder at resonance); 1 = full compensation (output peak
+    // held at unity even at maximum resonance, closer to hardware with
+    // its own internal limiting). Ignored for every other topology.
+    double filterResonanceCompensation01;
+
     // DAC back end (v2 heritage-roster plan, stage 5 -- RateModel.cpp's
     // applyDacPath). 1 when the machine's D/A conversion clock is the
     // SAME clock that sets pitch (S900/S950 -- "per-voice DAC clock is

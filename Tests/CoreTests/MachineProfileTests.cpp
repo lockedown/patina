@@ -107,14 +107,15 @@ AKZ_TEST(S3200_is_the_only_machine_with_two_filter_stages) {
 
 AKZ_TEST(filter_topology_matches_filter_has_resonance) {
     // filterHasResonance is a UI capability flag; filterTopology is what
-    // FilterModel.cpp actually dispatches on. As of v2 stage 2 (before
-    // stage 6's TPT migration) they must still agree for all six Akai
-    // machines: OnePoleCascade <-> no resonance, ChamberlinSvf <->
-    // resonance.
+    // FilterModel.cpp actually dispatches on. As of v2 stage 6 (the TPT
+    // migration): OnePoleCascade <-> no resonance, TptSvf <-> resonance
+    // -- ChamberlinSvf itself is retired from every current profile (see
+    // AkaizerCore.h; it stays defined for a future machine that
+    // specifically wants its un-migrated character).
     for (int m = 0; m < AkzMachine_Count; ++m) {
         const AkzMachineProfile* p = akz_machine_profile(static_cast<AkzMachine>(m));
         if (p->filterHasResonance) {
-            AKZ_CHECK(p->filterTopology == AkzFilterTopology_ChamberlinSvf);
+            AKZ_CHECK(p->filterTopology == AkzFilterTopology_TptSvf);
         } else {
             AKZ_CHECK(p->filterTopology == AkzFilterTopology_OnePoleCascade);
         }

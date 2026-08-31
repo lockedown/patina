@@ -131,20 +131,83 @@ private:
     double _band = 0.0;
 };
 
+// Zero-delay-feedback ("topology-preserving transform") state-variable
+// filter -- Zavalishin, "The Art of VA Filter Design". Unconditionally
+// stable for any g >= 0, k >= 0: no analogue of ChamberlinSVF's k <= 2
+// instability exists here, and none of ChamberlinSVF's empirical k <=
+// 1.1 clamp is needed. This is what migrates S2000/S3000/S3200 off
+// ChamberlinSvf (v2 heritage-roster plan's "TPT SVF" stage, a
+// deliberate, accepted sonic break) -- see ChamberlinSVF's own comment
+// above for the ~8kHz cutoff ceiling and passband-gain clipping bug
+// this replaces.
+class TptSvf : public IFilterStage {
+public:
+    TptSvf(double cutoffHz, int resonanceCode, double sampleRateHz, double resonanceCompensation01) {
+        const double clampedCutoff = std::min(cutoffHz, sampleRateHz * 0.49);
+        const double g = std::tan(M_PI * clampedCutoff / sampleRateHz);
+
+        // Same damping curve as ChamberlinSVF (bottoms out at 1/16,
+        // never reaching true self-oscillation) mapped to TPT's
+        // k = 1/Q -- k = 2 * damping is this project's own curve [I],
+        // not a hardware citation: damping = 1 (resonanceCode 0) gives
+        // k = 2 (Q = 0.5, an over-damped "no resonance" starting
+        // point); damping = 1/16 (resonanceCode 15) gives k = 0.125
+        // (Q = 8, a strong but finite, unconditionally stable peak).
+        const int clampedRes = std::max(0, std::min(15, resonanceCode));
+        const double damping = 1.0 - static_cast<double>(clampedRes) / 16.0;
+        _k = 2.0 * damping;
+
+        _a1 = 1.0 / (1.0 + g * (g + _k));
+        _a2 = g * _a1;
+        _a3 = g * _a2;
+
+        // Passband-gain compensation (the actual fix for the clipping
+        // bug ChamberlinSVF's clamp left behind): the resonant peak's
+        // height is approximately Q = 1/k -- real hardware character,
+        // kept, not eliminated -- but uncompensated it can exceed 1.0
+        // and clip downstream through PCMConversion.matchedGain's A/B
+        // loudness match. resonanceCompensation01 (AkzMachineProfile,
+        // [I] -- no manual specifies this) interpolates between 0 (no
+        // compensation, the peak passes through at full height) and 1
+        // (full compensation, output peak held at unity even at
+        // maximum resonance).
+        const double peakGain = std::max(1.0, 1.0 / std::max(_k, 1e-6));
+        _inputScale = 1.0 / (1.0 + resonanceCompensation01 * (peakGain - 1.0));
+    }
+
+    float process(float x) override {
+        const double v0 = static_cast<double>(x) * _inputScale;
+        const double v3 = v0 - _ic2eq;
+        const double v1 = _a1 * _ic1eq + _a2 * v3;
+        const double v2 = _ic2eq + _a2 * _ic1eq + _a3 * v3;
+        _ic1eq = 2.0 * v1 - _ic1eq;
+        _ic2eq = 2.0 * v2 - _ic2eq;
+        return static_cast<float>(v2); // lowpass output, same choice as ChamberlinSVF
+    }
+
+private:
+    double _k = 2.0;
+    double _a1 = 0.0, _a2 = 0.0, _a3 = 0.0;
+    double _inputScale = 1.0;
+    double _ic1eq = 0.0, _ic2eq = 0.0;
+};
+
 // Instantiates one stage of `topology`. `poles` is only meaningful for
 // OnePoleCascade (each other topology's pole count is a property of the
-// real chip, not a per-call parameter); `resonanceCode` is only
-// meaningful for the resonant topologies. Passing the irrelevant
-// argument for a given topology is harmless -- the constructor that
-// ignores it just ignores it.
-std::unique_ptr<IFilterStage> makeFilterStage(AkzFilterTopology topology, double cutoffHz, int resonanceCode, double sampleRateHz, int poles) {
+// real chip, not a per-call parameter); `resonanceCode`/
+// `resonanceCompensation01` are only meaningful for the resonant
+// topologies. Passing an irrelevant argument for a given topology is
+// harmless -- the constructor that ignores it just ignores it.
+std::unique_ptr<IFilterStage> makeFilterStage(AkzFilterTopology topology, double cutoffHz, int resonanceCode, double sampleRateHz, int poles, double resonanceCompensation01) {
     switch (topology) {
         case AkzFilterTopology_ChamberlinSvf:
             return std::make_unique<ChamberlinSVF>(cutoffHz, resonanceCode, sampleRateHz);
+        case AkzFilterTopology_TptSvf:
+            return std::make_unique<TptSvf>(cutoffHz, resonanceCode, sampleRateHz, resonanceCompensation01);
         case AkzFilterTopology_OnePoleCascade:
-        // TptSvf/SsmLadder/CemStateVariable/SwitchedCapacitor land with
-        // the machines that need them (heritage-roster plan stages 6,
-        // 10) -- falling through to OnePoleCascade rather than silently
+        // SsmLadder/CemStateVariable/SwitchedCapacitor land with the
+        // machines that need them (heritage-roster plan stage 10) --
+        // falling through to OnePoleCascade rather than silently
         // misrendering is a deliberate placeholder, not a real choice
         // for any of those topologies' actual character.
         default:
@@ -171,7 +234,7 @@ void applyFilter(float* buffer, size_t count, AkzMachine machine, float cutoff01
     std::vector<std::unique_ptr<IFilterStage>> stages;
     stages.reserve(static_cast<size_t>(stageCount));
     for (int i = 0; i < stageCount; ++i) {
-        stages.push_back(makeFilterStage(profile.filterTopology, cutoffHz, resonanceCode, sampleRateHz, poles));
+        stages.push_back(makeFilterStage(profile.filterTopology, cutoffHz, resonanceCode, sampleRateHz, poles, profile.filterResonanceCompensation01));
     }
 
     for (size_t i = 0; i < count; ++i) {

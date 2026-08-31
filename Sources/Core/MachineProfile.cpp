@@ -48,6 +48,7 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* filterTracksPitch */       1,                // per-voice MF6CN-50 clocked with the voice [M/I]
         /* filterTopology */          AkzFilterTopology_OnePoleCascade,
         /* filterStageCount */        1,
+        /* filterResonanceCompensation01 */ 0.0,        // unused -- OnePoleCascade has no resonance
         /* dacClockTracksPitch */     1,                // per-voice DAC clock is varied directly -- same physical clock as filterTracksPitch [M/I]
         /* interpolatorOrder */       0,                // no interpolation -- per-voice DAC clock is varied directly [I]
         /* supportsTimeStretch */     0,                // added in the S950; S900 has none [M]
@@ -73,6 +74,7 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* filterTracksPitch */       1,                // MF6CN-50 per voice, clock-tracked [M/I]
         /* filterTopology */          AkzFilterTopology_OnePoleCascade,
         /* filterStageCount */        1,
+        /* filterResonanceCompensation01 */ 0.0,        // unused -- OnePoleCascade has no resonance
         /* dacClockTracksPitch */     1,                // same physical clock as filterTracksPitch [M/I]
         /* interpolatorOrder */       0,                // no interpolation -- per-voice DAC clock varied directly [I]
         /* supportsTimeStretch */     1,
@@ -98,6 +100,7 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* filterTracksPitch */       0,                // fixed passive LC reconstruction, switched 10/20 kHz by rate, not by pitch [M]
         /* filterTopology */          AkzFilterTopology_OnePoleCascade,
         /* filterStageCount */        1,
+        /* filterResonanceCompensation01 */ 0.0,        // unused -- OnePoleCascade has no resonance
         /* dacClockTracksPitch */     0,                // "fixed passive LC reconstruction... not by pitch" -- same citation as filterTracksPitch [M]
         /* interpolatorOrder */       2,                // order unstated by Akai; linear assumed pending by-ear revision -- see plan "Known gaps" [I]
         /* supportsTimeStretch */     1,                // added in OS 2.0 [M]
@@ -121,8 +124,9 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* filterHasResonance */      1,                // identical L7A1045 silicon to the S3000XL, resonant SVF -- manual-confirmed, contra common belief [M]
         /* filterSlopeDbPerOctave */  12.0,             // 2-pole Chamberlin SVF
         /* filterTracksPitch */       0,                // runs at fixed 44.1kHz after pitch interpolation [M/I from MAME device]
-        /* filterTopology */          AkzFilterTopology_ChamberlinSvf, // superseded by TptSvf from v2 stage 6 on -- see AkaizerCore.h
+        /* filterTopology */          AkzFilterTopology_TptSvf,        // migrated off ChamberlinSvf in v2 stage 6 -- see AkaizerCore.h. Deliberate, accepted sonic break: fixes the ~8kHz cutoff cap and passband-gain clipping ChamberlinSvf's k<=1.1 stability clamp left behind.
         /* filterStageCount */        1,
+        /* filterResonanceCompensation01 */ 1.0,        // [I] -- full compensation, since the bug this migration fixes was specifically about clipping
         /* dacClockTracksPitch */     0,                // "runs at fixed 44.1kHz after pitch interpolation" -- same citation as filterTracksPitch [M/I]
         /* interpolatorOrder */       1,                // zero-order hold, per MAME l7a1045_l6028_dsp_a.cpp: frac bits discarded when addressing [I, best available evidence]
         /* supportsTimeStretch */     1,
@@ -146,8 +150,9 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* filterHasResonance */      1,                // same L7A1045 silicon as S2000 [M]
         /* filterSlopeDbPerOctave */  12.0,
         /* filterTracksPitch */       0,
-        /* filterTopology */          AkzFilterTopology_ChamberlinSvf, // superseded by TptSvf from v2 stage 6 on
+        /* filterTopology */          AkzFilterTopology_TptSvf,        // migrated off ChamberlinSvf in v2 stage 6, same rationale as S2000
         /* filterStageCount */        1,
+        /* filterResonanceCompensation01 */ 1.0,        // [I] -- full compensation
         /* dacClockTracksPitch */     0,                // same voice chip as S2000, fixed clock [I]
         /* interpolatorOrder */       1,                // zero-order hold, same voice chip as S2000 [I]
         /* supportsTimeStretch */     1,
@@ -171,8 +176,9 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* filterHasResonance */      1,                // primary L7A1045 filter, same as S2000/S3000
         /* filterSlopeDbPerOctave */  24.0,             // + optional 2nd digital filter (L7A0986 DFL) in series -> 24 dB/oct "Moog-ish" mode [M/I]
         /* filterTracksPitch */       0,
-        /* filterTopology */          AkzFilterTopology_ChamberlinSvf, // superseded by TptSvf from v2 stage 6 on
+        /* filterTopology */          AkzFilterTopology_TptSvf,        // migrated off ChamberlinSvf in v2 stage 6, same rationale as S2000
         /* filterStageCount */        2,                // the optional "2nd DIGITAL FILTER," both stages lowpass in series [M/I] -- replaces the old ">= 24.0 dB/oct" heuristic
+        /* filterResonanceCompensation01 */ 1.0,        // [I] -- full compensation
         /* dacClockTracksPitch */     0,                // same voice chip family, fixed clock [I]
         /* interpolatorOrder */       1,                // zero-order hold, same voice chip family [I]
         /* supportsTimeStretch */     1,
