@@ -13,16 +13,24 @@
 // module (`import AkaizerCore`), no bridging header or C++/Swift
 // interop mode needed, because the C++ implementation is entirely hidden
 // behind that C API by design (see AkaizerCore.h's header comment).
+//
+// The product/app target is "Patina" (v2's rename away from "Akaizer S"
+// -- see README's Status section: the roster is no longer Akai-only, so
+// an Akai-specific name stopped fitting). The internal module names
+// (AkaizerCore, AkaizerAudio) are deliberately NOT renamed -- they are
+// not user-facing, and renaming them would touch every `import
+// AkaizerCore`/`import AkaizerAudio` line in the app for no visible
+// benefit.
 
 import PackageDescription
 
 let package = Package(
-    name: "AkaizerS",
+    name: "Patina",
     platforms: [
         .macOS(.v14)
     ],
     products: [
-        .executable(name: "AkaizerS", targets: ["AkaizerSApp"])
+        .executable(name: "Patina", targets: ["PatinaApp"])
     ],
     targets: [
         .target(
@@ -39,7 +47,7 @@ let package = Package(
             path: "Sources/Audio"
         ),
         .executableTarget(
-            name: "AkaizerSApp",
+            name: "PatinaApp",
             dependencies: ["AkaizerAudio", "AkaizerCore"],
             path: "Sources/App"
         ),

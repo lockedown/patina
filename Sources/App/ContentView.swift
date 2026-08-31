@@ -763,7 +763,7 @@ struct ContentView: View {
                 // Copy synchronously, inside this closure -- url itself
                 // stops being valid the moment it returns.
                 let stagingDir = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("AkaizerS-Drop", isDirectory: true)
+                    .appendingPathComponent("Patina-Drop", isDirectory: true)
                     .appendingPathComponent(UUID().uuidString, isDirectory: true)
                 try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
                 let destination = stagingDir.appendingPathComponent(url.lastPathComponent)
@@ -784,7 +784,7 @@ struct ContentView: View {
         // would re-import the just-rendered copy as if it were a
         // brand-new sample.
         let dragTempDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("AkaizerS-Drag", isDirectory: true)
+            .appendingPathComponent("Patina-Drag", isDirectory: true)
         guard !url.path.hasPrefix(dragTempDir.path) else {
             return
         }
@@ -800,7 +800,7 @@ struct ContentView: View {
     /// public.file-url). Worst case either way is a harmless leak in the
     /// OS temp dir until this runs again.
     private func _sweepDragExportTempFiles() {
-        for name in ["AkaizerS-Drag", "AkaizerS-Drop"] {
+        for name in ["Patina-Drag", "Patina-Drop"] {
             let dir = FileManager.default.temporaryDirectory.appendingPathComponent(name, isDirectory: true)
             try? FileManager.default.removeItem(at: dir)
         }
