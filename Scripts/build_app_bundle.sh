@@ -1,7 +1,7 @@
 #!/bin/sh
 # build_app_bundle.sh
 #
-# Distribution prep: assembles a real AkaizerS.app from the SwiftPM
+# Distribution prep: assembles a real Patina.app from the SwiftPM
 # release binary -- `swift build` alone produces a bare Mach-O
 # executable, not a macOS app bundle, which is why the app has needed
 # the NSApplicationDelegate activation-policy workaround since stage 4
@@ -24,8 +24,8 @@ set -e
 
 cd "$(dirname "$0")/.."
 
-APP_NAME="AkaizerS"
-BUNDLE_NAME="Akaizer S.app"
+APP_NAME="Patina"
+BUNDLE_NAME="Patina.app"
 DIST_DIR="dist"
 BUNDLE_PATH="$DIST_DIR/$BUNDLE_NAME"
 

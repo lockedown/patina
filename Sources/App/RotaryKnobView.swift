@@ -29,13 +29,9 @@
 // interaction -- drag, reset, VoiceOver increment -- as one coalesced
 // undo step for ContentView's undo stack.
 
+import AkaizerAudio
 import AppKit
 import SwiftUI
-
-enum KnobTaper {
-    case linear
-    case logarithmic
-}
 
 struct RotaryKnobView: View {
     @Binding var value: Double

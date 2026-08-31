@@ -15,14 +15,15 @@
 //      than a separate effect bolted on.
 
 #include "StretchEngine.h"
-#include "ConverterModel.h"
 #include "FilterModel.h"
 #include "Interpolator.h"
 #include "MachineProfile.h"
+#include "RateModel.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <type_traits>
 
 namespace akz {
 
@@ -292,18 +293,33 @@ void StretchEngine::_recompute() {
     _output.clear();
     _readPos = 0;
 
-    // Converter model (build order stage 6): re-quantise fresh from the
-    // untouched _source every time, to the CURRENT machine's bit depth --
-    // this models "what this file would sound like sampled into the
-    // machine at its native bit depth" (this app's whole premise), not a
-    // one-way bit-crush baked in permanently. See ConverterModel.h for
-    // what's deliberately not modelled yet (variable sample rate, DAC
-    // low-level distortion).
+    // Record path (v2 heritage-roster plan, stage 4 -- rate/bandwidth
+    // front end; build order stage 6's converter, folded into it): fresh
+    // from the untouched _source every time, to the CURRENT machine's
+    // sample rate AND bit depth -- this models "what this file would
+    // sound like sampled into the machine" (this app's whole premise),
+    // not a one-way bit-crush/decimate baked in permanently.
+    // resolveSampleRateHz's 0-means-host-rate sentinel is what keeps
+    // this a no-op for every preset/default that predates sampleRateHz
+    // -- see RateModel.h. See ConverterModel.h for what's still not
+    // modelled (companding, DAC low-level distortion -- stage 7).
     _quantizedSource = _source;
-    quantizeBuffer(_quantizedSource.data(), _quantizedSource.size(), machineProfile(_params.machine).bitDepth);
+    const double effectiveRateHz = resolveSampleRateHz(_params.machine, _params.sampleRateHz, _sampleRateHz);
+    applyRecordPath(_quantizedSource.data(), _quantizedSource.size(), _params.machine, effectiveRateHz, _sampleRateHz);
 
     const int cycleLength = std::max(kMinCycleLength, _params.cycleLengthSamples);
-    const double ratio = static_cast<double>(_params.timeFactorPercent) / 100.0;
+    // Defense in depth, not just a UI gate: a machine whose profile says
+    // it has no time-stretch capability (S900 today; more join it as the
+    // heritage roster grows) gets ratio 1.0 from the engine itself,
+    // regardless of what timeFactorPercent the caller happens to be
+    // holding. ContentView.swift's UI already disables the Stretch knob
+    // for these machines, but that's advisory -- this is what actually
+    // prevents it, the same "belt and suspenders" reasoning as the
+    // maxStretchPercent clamp that fixed the S900 crash (see README's
+    // "Gotchas fixed along the way").
+    const double ratio = machineProfile(_params.machine).supportsTimeStretch
+        ? static_cast<double>(_params.timeFactorPercent) / 100.0
+        : 1.0;
     const double rawOutLen = static_cast<double>(_quantizedSource.size()) * ratio;
 
     if (_quantizedSource.empty()) {
@@ -368,6 +384,25 @@ void StretchEngine::_recompute() {
         _output = resample(_output.data(), _output.size(), transposeRatio, kind);
     }
 
+    // DAC back end (v2 heritage-roster plan, stage 5): the digital
+    // signal, played back through a real DAC clocked at the machine's
+    // rate, holds each sample for one DAC-clock period before the next
+    // -- a distinct artifact from Interpolator's own source-side
+    // zero-order-hold pitch resampling above (which picks WHICH stored
+    // sample plays; this is about what the OUTPUT looks like once it
+    // does). Runs AFTER transpose, BEFORE the pre-filter cache point, so
+    // a live-audition filter-only change (reapplyFilterOnly) inherits
+    // this for free instead of needing to redo it. Only tracks pitch on
+    // a machine whose physical DAC clock genuinely is the pitch clock
+    // (dacClockTracksPitch -- S900/S950); everything else converts at a
+    // fixed native rate regardless of transpose, per FilterModel.h's own
+    // citations for why their VCF doesn't track pitch either.
+    if (!_output.empty()) {
+        const AkzMachineProfile& dacProfile = machineProfile(_params.machine);
+        const double playbackRateHz = dacProfile.dacClockTracksPitch ? effectiveRateHz * transposeRatio : effectiveRateHz;
+        applyDacPath(_output.data(), _output.size(), _params.machine, playbackRateHz, _sampleRateHz);
+    }
+
     // Cached here, before the filter runs, so reapplyFilterOnly() can redo
     // just the last stage when a live-audition change turns out to be
     // filter-only (see paramsDifferOnlyInFilter()) instead of re-running
@@ -400,19 +435,61 @@ void StretchEngine::reapplyFilterOnly(const AkzStretchParams& params) {
     _dirty = false;
 }
 
+// Guard rails for the memcmp below, both checked at compile time rather
+// than trusted:
+//
+//   1. standard-layout is what makes memcmp over this type well-defined
+//      in the first place (no vtable, no base classes, nothing the
+//      language is free to lay out however it likes).
+//   2. The explicit per-field size sum catches padding: if it ever falls
+//      short of sizeof(AkzStretchParams), either a new field was added
+//      to the struct but NOT to this list (the exact "forgotten mirror"
+//      this is meant to catch), or a field's size introduced an
+//      alignment gap the memcmp would read as uninitialised bytes. Every
+//      field today is 4 bytes (enums, int32, float) specifically so the
+//      struct stays gap-free; a differently-sized field needs this
+//      approach revisited, not just extended.
+//   3. The literal size check is a blunter trip-wire: any struct-size
+//      change at all, for any reason, must not go unnoticed. Bump N,
+//      then update the four mirrors named below in the same commit.
+static_assert(std::is_standard_layout<AkzStretchParams>::value,
+    "AkzStretchParams must stay standard-layout for paramsDifferOnlyInFilter's memcmp to be well-defined.");
+static_assert(
+    sizeof(AkzStretchParams::machine) + sizeof(AkzStretchParams::engine) + sizeof(AkzStretchParams::mode) +
+    sizeof(AkzStretchParams::timeFactorPercent) + sizeof(AkzStretchParams::cycleLengthSamples) +
+    sizeof(AkzStretchParams::quality) + sizeof(AkzStretchParams::width) +
+    sizeof(AkzStretchParams::transposeSemitones) +
+    sizeof(AkzStretchParams::filterCutoff01) + sizeof(AkzStretchParams::filterResonance01) +
+    sizeof(AkzStretchParams::sampleRateHz)
+    == sizeof(AkzStretchParams),
+    "AkzStretchParams has a field this sum doesn't account for (or padding), so paramsDifferOnlyInFilter's "
+    "memcmp would compare uninitialised bytes. If you added a field: add it to this sum AND to the "
+    "sizeof(AkzStretchParams) == N check below.");
+static_assert(sizeof(AkzStretchParams) == 44,
+    "AkzStretchParams changed size -- update, in the same commit: akz_stretch_params_default (below), "
+    "the per-field sum static_assert above, StretchBridge.swift's positional AkzStretchParams init "
+    "(intentionally positional so this is a compile error there too), ParamSnapshot.swift, and "
+    "PresetStore.swift's decodeIfPresent handling for the new field.");
+
 bool StretchEngine::paramsDifferOnlyInFilter(const AkzStretchParams& a, const AkzStretchParams& b) {
     const bool filterFieldsDiffer = a.filterCutoff01 != b.filterCutoff01 || a.filterResonance01 != b.filterResonance01;
     if (!filterFieldsDiffer) {
         return false; // identical, or nothing filter-related changed -- caller has nothing to special-case
     }
-    return a.machine == b.machine
-        && a.engine == b.engine
-        && a.mode == b.mode
-        && a.timeFactorPercent == b.timeFactorPercent
-        && a.cycleLengthSamples == b.cycleLengthSamples
-        && a.quality == b.quality
-        && a.width == b.width
-        && a.transposeSemitones == b.transposeSemitones;
+
+    // Copy-and-zero-the-filter-fields-then-memcmp, rather than the old
+    // hand-enumerated field-by-field comparison: every OTHER field is
+    // automatically covered, including ones added after this was
+    // written (sampleRateHz, and whatever stage 4/7 add), instead of
+    // silently taking the filter-only cheap path for a change this
+    // function was never updated to know about.
+    AkzStretchParams aWithoutFilter = a;
+    AkzStretchParams bWithoutFilter = b;
+    aWithoutFilter.filterCutoff01 = 0.0f;
+    aWithoutFilter.filterResonance01 = 0.0f;
+    bWithoutFilter.filterCutoff01 = 0.0f;
+    bWithoutFilter.filterResonance01 = 0.0f;
+    return std::memcmp(&aWithoutFilter, &bWithoutFilter, sizeof(AkzStretchParams)) == 0;
 }
 
 size_t StretchEngine::process(float* outFrames, size_t maxOutFrames) {
@@ -438,7 +515,12 @@ size_t StretchEngine::outputLength() const {
             return 0;
         }
         const int cycleLength = std::max(kMinCycleLength, _params.cycleLengthSamples);
-        const double ratio = static_cast<double>(_params.timeFactorPercent) / 100.0;
+        // Mirrors _recompute()'s same defense-in-depth clamp -- see the
+        // comment there. Must stay identical or outputLength() (callable
+        // before process() has ever run) and the actual render disagree.
+        const double ratio = machineProfile(_params.machine).supportsTimeStretch
+            ? static_cast<double>(_params.timeFactorPercent) / 100.0
+            : 1.0;
         const double rawOutLen = static_cast<double>(_source.size()) * ratio;
         const AkzStretchMode effectiveMode = machineProfile(_params.machine).hasModeSwitch
             ? _params.mode
@@ -490,6 +572,7 @@ void akz_stretch_params_default(AkzMachine machine, AkzStretchParams* out_params
     out_params->transposeSemitones = 0.0f;
     out_params->filterCutoff01 = 1.0f;   // fully open -- matches the hardware's own "0xffff = Nyquist" default
     out_params->filterResonance01 = 0.0f;
+    out_params->sampleRateHz = 0.0f;     // 0 = machine default -- see AkaizerCore.h
 }
 
 AkzStretchEngine* akz_stretch_engine_create(double sampleRateHz) {

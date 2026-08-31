@@ -1,6 +1,6 @@
 // generate_icon.swift
 //
-// One-time app icon generator for Akaizer S -- not part of the
+// One-time app icon generator for Patina -- not part of the
 // repeatable build (build_app_bundle.sh just copies the already-built
 // Resources/AppIcon.icns). Run this again only if the icon design
 // itself changes.

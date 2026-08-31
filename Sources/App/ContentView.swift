@@ -51,6 +51,10 @@ struct ContentView: View {
     @State private var transposeSemitones: Double = 0
     @State private var filterCutoff: Double = 1.0
     @State private var filterResonance: Double = 0.0
+    /// 0 = machine default. No UI control sets this yet -- heritage-
+    /// roster plan stages 4/9 add the bandwidth knob; wired through the
+    /// snapshot/undo/preset machinery now so that lands additively.
+    @State private var sampleRateHz: Double = 0
     @State private var processedChannels: [[Float]]?
 
     @State private var isLiveAuditionOn = false
@@ -102,14 +106,18 @@ struct ContentView: View {
 
     /// Most-recently-opened files, newest first, capped -- a quick-switch
     /// jump list for the sidebar, not the batch queue the plan
-    /// explicitly ruled out. Session-only for now; stage 9 (presets) may
-    /// give this real persistence.
+    /// explicitly ruled out. Persisted via RecentFilesStore since v2
+    /// (was session-only in v1).
     @State private var recentFiles: [URL] = []
     private let maxRecentFiles = 8
 
     /// Named parameter sets -- "Jungle S950," "Dusty S1000," the plan's
     /// own examples. Persisted via PresetStore, loaded once on launch.
     @State private var presets: [AkaizerPreset] = []
+
+    /// Filters the sidebar's MACHINES section (v2 heritage-roster plan,
+    /// stage 9) -- only shown once the roster is long enough to need it.
+    @State private var machineSearchText: String = ""
 
     /// Mono (channel 0) traces for WaveformView. Decoded once per load/
     /// process rather than in the view body, so scrolling/resizing the
@@ -120,6 +128,7 @@ struct ContentView: View {
     private let audioFileService = AudioFileService()
     private let playback = AudioPlaybackController()
     private let presetStore = PresetStore()
+    private let recentFilesStore = RecentFilesStore(maxCount: 8)
 
     private var machineProfile: AkzMachineProfile {
         StretchProcessor.profile(for: selectedMachine)
@@ -197,7 +206,113 @@ struct ContentView: View {
         }
         rows.append(filterFields)
 
+        // Bandwidth (v2 heritage-roster plan, stage 4/9) -- only on a
+        // machine whose sample rate is genuinely a knob, not a fixed
+        // spec. sampleRateHz == 0 (the RateModel.h sentinel) reads as
+        // "fully open," matching the filter cutoff's own 0xffff/Nyquist
+        // convention, rather than showing a literal 0hz.
+        if machineProfile.hasVariableSampleRate != 0 {
+            let displayHz = sampleRateHz > 0 ? sampleRateHz : machineProfile.maxSampleRateHz
+            rows.append([LCDField("rate", "\(Int(displayHz))hz")])
+        }
+
+        if _inferredStageCount > 0 {
+            rows.append([LCDField("modelled", "\(_citedStageCount) cited · \(_inferredStageCount) inferred")])
+        }
+
         return rows
+    }
+
+    // -- provenance (v2 heritage-roster plan, stage 9) ------------------------
+
+    /// Stages whose provenance for the current machine is Inferred or
+    /// Unmodelled -- the "must be visible in the UI" half of v2's
+    /// fidelity bar (citation-first, inference allowed only if flagged).
+    private var _inferredStageCount: Int {
+        StretchProcessor.allStages.filter {
+            let level = StretchProcessor.provenance(for: selectedMachine, stage: $0).level
+            return level == AkzProvenanceLevel_Inferred || level == AkzProvenanceLevel_Unmodelled
+        }.count
+    }
+
+    private var _citedStageCount: Int {
+        StretchProcessor.allStages.count - _inferredStageCount
+    }
+
+    /// Read-only machine identity + capability chips + the "Modelled
+    /// from..." provenance panel. Replaces the Machine Picker that used
+    /// to live here -- selection itself moved to the sidebar.
+    private var _machineHeader: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text(machineProfile.displayName)
+                    .font(.headline)
+                // String(year), not raw Int interpolation -- Text's
+                // LocalizedStringKey interpolation formats an
+                // interpolated Int with locale grouping by default
+                // ("1,988"), which reads as a quantity, not a year.
+                Text("\(machineProfile.manufacturerName) · \(String(machineProfile.yearIntroduced))")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if _stretchIsSupported {
+                    _capabilityChip("Stretch")
+                }
+                if _filterHasResonance {
+                    _capabilityChip("Resonance")
+                }
+                if machineProfile.hasVariableSampleRate != 0 {
+                    _capabilityChip("Bandwidth")
+                }
+            }
+
+            DisclosureGroup("Modelled from…") {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(StretchProcessor.allStages, id: \.rawValue) { stage in
+                        _provenanceRow(stage)
+                    }
+                }
+                .padding(.top, 4)
+            }
+            .font(.caption)
+        }
+    }
+
+    private func _capabilityChip(_ text: String) -> some View {
+        Text(text)
+            .font(.caption2.weight(.medium))
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Color.accentColor.opacity(0.15), in: Capsule())
+            .foregroundStyle(Color.accentColor)
+    }
+
+    private func _provenanceRow(_ stage: AkzStage) -> some View {
+        let (level, note) = StretchProcessor.provenance(for: selectedMachine, stage: stage)
+        let isInferred = level == AkzProvenanceLevel_Inferred || level == AkzProvenanceLevel_Unmodelled
+        return HStack(alignment: .top, spacing: 6) {
+            Text(_provenanceBadge(level))
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(isInferred ? .orange : .secondary)
+                .frame(width: 60, alignment: .leading)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(StretchProcessor.label(for: stage))
+                    .font(.caption.weight(.medium))
+                Text(note)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func _provenanceBadge(_ level: AkzProvenanceLevel) -> String {
+        switch level {
+        case AkzProvenanceLevel_Measured: return "MEASURED"
+        case AkzProvenanceLevel_Manual: return "CITED"
+        case AkzProvenanceLevel_Inferred: return "INFERRED"
+        case AkzProvenanceLevel_Unmodelled: return "N/A"
+        default: return "?"
+        }
     }
 
     var body: some View {
@@ -240,7 +355,12 @@ struct ContentView: View {
             }
         }
         .onAppear {
-            presets = presetStore.load()
+            let (loadedPresets, presetError) = presetStore.loadOrRecover()
+            presets = loadedPresets
+            recentFiles = recentFilesStore.load()
+            if let presetError {
+                statusMessage = presetError
+            }
             playback.onFinished = { isPlayingOffline = false }
             _autoloadIfRequested()
             _sweepDragExportTempFiles()
@@ -260,8 +380,63 @@ struct ContentView: View {
 
     // -- layout --------------------------------------------------------------
 
+    /// Machines filtered by `machineSearchText`, grouped by manufacturer
+    /// -- v2 heritage-roster plan, stage 9: replaces the flat Machine
+    /// Picker once the roster grows past six. Groups are ordered by
+    /// each manufacturer's first appearance in
+    /// StretchProcessor.allMachines (itself AkzMachine's declaration
+    /// order), not alphabetically -- Akai first, matching the app's own
+    /// history.
+    private var _groupedMachines: [(manufacturer: String, machines: [AkzMachine])] {
+        let filtered = StretchProcessor.allMachines.filter { machine in
+            guard !machineSearchText.isEmpty else { return true }
+            let profile = StretchProcessor.profile(for: machine)
+            return profile.displayName.localizedCaseInsensitiveContains(machineSearchText)
+                || profile.manufacturerName.localizedCaseInsensitiveContains(machineSearchText)
+        }
+        var order: [String] = []
+        var groups: [String: [AkzMachine]] = [:]
+        for machine in filtered {
+            let manufacturer = StretchProcessor.profile(for: machine).manufacturerName
+            if groups[manufacturer] == nil { order.append(manufacturer) }
+            groups[manufacturer, default: []].append(machine)
+        }
+        return order.map { (manufacturer: $0, machines: groups[$0] ?? []) }
+    }
+
     private var _sidebar: some View {
+        ScrollView {
         VStack(alignment: .leading, spacing: 2) {
+            Text("MACHINES")
+                .font(.caption.weight(.semibold))
+                .tracking(1.0)
+                .foregroundStyle(.secondary)
+                .padding(.top, 16)
+                .padding(.horizontal, 14)
+                .padding(.bottom, 6)
+
+            // Only worth the pixels once the roster is long enough to
+            // need it -- a fixed threshold rather than always-on, since
+            // six machines fit on screen with room to spare.
+            if StretchProcessor.allMachines.count > 8 {
+                TextField("Filter…", text: $machineSearchText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 4)
+            }
+
+            ForEach(_groupedMachines, id: \.manufacturer) { group in
+                Text(group.manufacturer.uppercased())
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 14)
+                    .padding(.top, 4)
+                ForEach(group.machines, id: \.rawValue) { machine in
+                    _machineRow(machine)
+                }
+            }
+
             Text("RECENT")
                 .font(.caption.weight(.semibold))
                 .tracking(1.0)
@@ -300,11 +475,35 @@ struct ContentView: View {
                 }
             }
 
-            Spacer()
         }
-        .frame(width: 190)
+        .padding(.bottom, 16)
+        }
+        .frame(width: 220)
         .frame(maxHeight: .infinity)
         .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    private func _machineRow(_ machine: AkzMachine) -> some View {
+        let isSelected = machine == selectedMachine
+        return Button(action: { _selectMachine(machine) }) {
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(isSelected ? Color.accentColor : .clear)
+                    .frame(width: 6, height: 6)
+                Text(StretchProcessor.profile(for: machine).displayName)
+                    .font(.callout)
+                    .lineLimit(1)
+                    .foregroundStyle(isSelected ? Color.primary : Color.secondary)
+                Spacer()
+                Text(String(StretchProcessor.profile(for: machine).yearIntroduced)) // not raw Int interpolation -- see _machineHeader's comment
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 5)
+        }
+        .buttonStyle(.plain)
+        .background(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
     }
 
     private func _presetRow(_ preset: AkaizerPreset) -> some View {
@@ -404,20 +603,26 @@ struct ContentView: View {
 
             GroupBox("Time stretch") {
                 VStack(alignment: .leading, spacing: 10) {
-                    Picker("Machine", selection: Binding(get: { selectedMachine }, set: _selectMachine)) {
-                        ForEach(StretchProcessor.allMachines, id: \.rawValue) { machine in
-                            Text(StretchProcessor.profile(for: machine).displayName).tag(machine)
-                        }
-                    }
-                    .onChange(of: selectedEngine) { _, _ in _pushLiveParamsIfNeeded() }
-                    .onChange(of: selectedMode) { _, _ in _pushLiveParamsIfNeeded() }
-                    .onChange(of: stretchPercent) { _, _ in _pushLiveParamsIfNeeded() }
-                    .onChange(of: cycleLength) { _, _ in _pushLiveParamsIfNeeded() }
-                    .onChange(of: quality) { _, _ in _pushLiveParamsIfNeeded() }
-                    .onChange(of: width) { _, _ in _pushLiveParamsIfNeeded() }
-                    .onChange(of: transposeSemitones) { _, _ in _pushLiveParamsIfNeeded() }
-                    .onChange(of: filterCutoff) { _, _ in _pushLiveParamsIfNeeded() }
-                    .onChange(of: filterResonance) { _, _ in _pushLiveParamsIfNeeded() }
+                    // Machine selection moved to the sidebar's MACHINES
+                    // section (v2 heritage-roster plan, stage 9) once a
+                    // flat Picker stopped scaling past six -- this is
+                    // now a read-only header plus the provenance panel,
+                    // not a second selection surface. The live-param
+                    // push chain (unchanged mechanism -- attaching to
+                    // ANY mounted view in this subtree behaves
+                    // identically) moves here since the Picker it used
+                    // to ride on is gone.
+                    _machineHeader
+                        .onChange(of: selectedEngine) { _, _ in _pushLiveParamsIfNeeded() }
+                        .onChange(of: selectedMode) { _, _ in _pushLiveParamsIfNeeded() }
+                        .onChange(of: stretchPercent) { _, _ in _pushLiveParamsIfNeeded() }
+                        .onChange(of: cycleLength) { _, _ in _pushLiveParamsIfNeeded() }
+                        .onChange(of: quality) { _, _ in _pushLiveParamsIfNeeded() }
+                        .onChange(of: width) { _, _ in _pushLiveParamsIfNeeded() }
+                        .onChange(of: transposeSemitones) { _, _ in _pushLiveParamsIfNeeded() }
+                        .onChange(of: filterCutoff) { _, _ in _pushLiveParamsIfNeeded() }
+                        .onChange(of: filterResonance) { _, _ in _pushLiveParamsIfNeeded() }
+                        .onChange(of: sampleRateHz) { _, _ in _pushLiveParamsIfNeeded() }
 
                     Picker("Engine", selection: _undoableBinding(get: { selectedEngine }, set: { selectedEngine = $0 })) {
                         Text("Classic").tag(AkzEngine_Classic)
@@ -441,108 +646,24 @@ struct ContentView: View {
                     // combinations. ScrollView on the whole pane (below)
                     // is the backstop; a single flat row is the fix that
                     // actually keeps the common case short.
+                    //
+                    // Generated from MachineControls.controls(for:mode:)
+                    // (v2 heritage-roster plan, stage 9) rather than a
+                    // hand-written chain of `if`s -- SP-1200 (Bandwidth +
+                    // Cutoff + Transpose, no stretch cluster at all) and
+                    // S950 (bandwidth AND stretch together) are
+                    // orthogonal axes that used to multiply combinations
+                    // by hand; the descriptor table gets every
+                    // combination right by construction instead.
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(alignment: .top, spacing: 20) {
-                            // Transpose is a basic sampler feature every
-                            // one of these machines has (unlike
-                            // time-stretch, which the S900 lacks -- plan
-                            // section 3.1), so it's shown unconditionally
-                            // rather than gated on _stretchIsSupported.
-                            // Varispeed: pitch and duration move
-                            // together, matching the real hardware -- see
-                            // Interpolator.h.
-                            _knobCell(
-                                "Transpose", value: $transposeSemitones,
-                                range: -36...36, taper: .linear, step: 1,
-                                defaultValue: Double(_defaultParams.transposeSemitones),
-                                format: "%.0f st"
-                            )
-
-                            // Filter (build order stage 6) applies
-                            // regardless of whether the machine supports
-                            // time-stretch -- every one of these machines
-                            // has SOME VCF (plan section 3.1), so cutoff
-                            // is shown unconditionally. Cutoff's own 0..1
-                            // knob stays linear even though it feels
-                            // logarithmic in use -- FilterModel already
-                            // bends it to 20 Hz..Nyquist one layer down,
-                            // so a log taper here would double-bend the
-                            // same curve.
-                            _knobCell(
-                                "Cutoff", value: $filterCutoff,
-                                range: 0...1, taper: .linear, step: nil,
-                                defaultValue: Double(_defaultParams.filterCutoff01),
-                                format: "%.2f"
-                            )
-
-                            // Resonance only does anything on
-                            // S2000/S3000/S3200 (plan section 3.2 item 2
-                            // -- the S2000 correction) so it's hidden
-                            // rather than shown-but-inert elsewhere.
-                            if _filterHasResonance {
+                            ForEach(MachineControls.controls(for: selectedMachine, mode: selectedMode), id: \.id) { descriptor in
                                 _knobCell(
-                                    "Resonance", value: $filterResonance,
-                                    range: 0...1, taper: .linear, step: nil,
-                                    defaultValue: Double(_defaultParams.filterResonance01),
-                                    format: "%.2f"
+                                    descriptor.label, value: _binding(for: descriptor.id),
+                                    range: descriptor.range, taper: descriptor.taper, step: descriptor.step,
+                                    defaultValue: _defaultValue(for: descriptor.id),
+                                    format: descriptor.format
                                 )
-                            }
-
-                            if _stretchIsSupported {
-                                // Stretch spans 25..2000% (25..999 on the
-                                // S950) -- close to two orders of
-                                // magnitude, with the musically useful
-                                // region bunched near 100%. A logarithmic
-                                // taper gives equal knob rotation to
-                                // equal *ratio* change (e.g. 50%->100%
-                                // feels like the same twist as
-                                // 100%->200%), matching how a
-                                // time-stretch amount is actually heard
-                                // -- a linear taper would crowd
-                                // everything below 200% into a sliver of
-                                // the knob's travel.
-                                _knobCell(
-                                    "Stretch", value: $stretchPercent,
-                                    range: 25...max(25.0, Double(machineProfile.maxStretchPercent)),
-                                    taper: .logarithmic, step: 1,
-                                    defaultValue: Double(_defaultParams.timeFactorPercent),
-                                    format: "%.0f%%"
-                                )
-
-                                // Cycle length only means anything in
-                                // CYCLIC; quality/width only in
-                                // INTELLIGENT (plan "2.2", and each
-                                // field's own doc comment in
-                                // AkaizerCore.h) -- shown accordingly
-                                // rather than all-visible-but-some-inert.
-                                if _isIntelligentMode {
-                                    _knobCell(
-                                        "Quality", value: $quality,
-                                        range: 0...99, taper: .linear, step: 1,
-                                        defaultValue: Double(_defaultParams.quality),
-                                        format: "%.0f"
-                                    )
-                                    _knobCell(
-                                        "Width", value: $width,
-                                        range: 0...99, taper: .linear, step: 1,
-                                        defaultValue: Double(_defaultParams.width),
-                                        format: "%.0f"
-                                    )
-                                } else {
-                                    // 20..2000 samples is the same
-                                    // span-of-two-orders-of-magnitude
-                                    // case as Stretch, for the same
-                                    // reason: cycle length is felt/heard
-                                    // as a ratio (an octave of grain
-                                    // length), not a linear sample count,
-                                    // so it gets the same log taper.
-                                    _knobCell(
-                                        "Cycle", value: $cycleLength,
-                                        range: 20...2000, taper: .logarithmic, step: 1,
-                                        defaultValue: Double(_defaultParams.cycleLengthSamples),
-                                        format: "%.0f smp"
-                                    )
-                                }
                             }
 
                             Spacer(minLength: 0)
@@ -560,7 +681,14 @@ struct ContentView: View {
                         // thing standing between this and a crash, don't
                         // offer stretch knobs for a machine that
                         // structurally doesn't have the feature.
-                        Text("\(machineProfile.displayName) has no time-stretch capability (added in the S950).")
+                        // "(added in the S950)" only makes sense for
+                        // S900 -- the four heritage-roster machines
+                        // (v2 stage 10) never had time-stretch at all,
+                        // so the notice is machine-specific rather than
+                        // always naming the S950.
+                        Text(selectedMachine == AkzMachine_S900
+                            ? "\(machineProfile.displayName) has no time-stretch capability (added in the S950)."
+                            : "\(machineProfile.displayName) has no time-stretch capability -- Preview/Process still apply its converter, filter and varispeed character.")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                     }
@@ -585,7 +713,24 @@ struct ContentView: View {
                             )
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(loadedSample == nil || !_stretchIsSupported)
+                        // No `|| !_stretchIsSupported` here (v2
+                        // heritage-roster plan, stage 11 fix): every
+                        // machine has SOME audio-affecting parameters
+                        // (Transpose, Cutoff, and now Bandwidth are all
+                        // unconditional -- MachineControls.swift), not
+                        // just the ones that time-stretch. Disabling
+                        // Preview/Process for a no-stretch machine
+                        // predates v2 (it also silently blocked S900),
+                        // but four of the ten machines here have NO
+                        // time-stretch at all -- leaving it in would
+                        // have meant SP-1200/Fairlight/Mirage/Emulator
+                        // II could show knobs a user could never
+                        // actually hear or export. StretchEngine.cpp's
+                        // own supportsTimeStretch gate (stage 3) already
+                        // forces ratio 1.0 for these machines regardless
+                        // of what the UI sends, so processing one is
+                        // always safe.
+                        .disabled(loadedSample == nil)
                         .help("Hear the fully processed result live while you turn the knobs. Nothing is written until you press Process.")
 
                         if isLiveAuditionOn && isRecomputingVisible {
@@ -606,7 +751,7 @@ struct ContentView: View {
 
                     HStack {
                         Button("Process", action: process)
-                            .disabled(loadedSample == nil || !_stretchIsSupported)
+                            .disabled(loadedSample == nil) // see the Preview button's comment above -- every machine has something to process, not just stretch-capable ones
                         Button("Revert", action: _revertToOriginal)
                             .disabled(loadedSample == nil || (_snapshot() == .defaults(for: selectedMachine) && processedChannels == nil))
                             .help("Reset all parameters to \(machineProfile.displayName) defaults and discard the processed render. Does not modify the file on disk.")
@@ -630,6 +775,20 @@ struct ContentView: View {
                             .keyboardShortcut(".", modifiers: .command)
                         Button(_renderIsStale ? "Save Processed… (stale)" : "Save Processed…", action: saveProcessed)
                             .disabled(processedChannels == nil)
+                        // v2 heritage-roster plan, stage 11: closes the
+                        // README's "no 'save what I'm hearing right
+                        // now' path" gap. Save Processed above saves the
+                        // last offline Process() result, which can
+                        // differ from live audition's current sound if
+                        // a knob moved since the last Process press --
+                        // this renders fresh from the CURRENT params
+                        // (the same ones live audition is already
+                        // playing, via _currentParams()) without
+                        // stopping audition, so what gets saved is
+                        // provably what's audible right now.
+                        Button("Save Preview…", action: _saveWhatImHearing)
+                            .disabled(loadedSample == nil || !isLiveAuditionOn)
+                            .help("Render and save exactly what live audition is currently playing, without stopping it.")
                         Button("Save Preset…", action: _promptSavePreset)
                             .disabled(loadedSample == nil)
                     }
@@ -643,6 +802,48 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    /// Maps a MachineControls.ParamID to its backing @State var's
+    /// Binding<Double> -- the seam that lets the knob row be generated
+    /// from MachineControls.controls(for:mode:) (stage 9) without a
+    /// SamplerModel view model (see this file's header note on why that
+    /// extraction was skipped): each parameter still lives in its own
+    /// @State var here, this switch is just how a descriptor finds it.
+    private func _binding(for id: ParamID) -> Binding<Double> {
+        switch id {
+        case .transpose: return $transposeSemitones
+        case .bandwidth: return $sampleRateHz
+        case .cutoff: return $filterCutoff
+        case .resonance: return $filterResonance
+        case .stretch: return $stretchPercent
+        case .cycle: return $cycleLength
+        case .quality: return $quality
+        case .width: return $width
+        }
+    }
+
+    /// Double-click-to-reset target for one knob -- the current
+    /// machine's documented default, same principle as every other
+    /// knob's defaultValue. Bandwidth is a deliberate exception:
+    /// AkzStretchParams.sampleRateHz's own default is 0 ("no rate
+    /// stage" -- RateModel.h), which sits BELOW the knob's own
+    /// [minSampleRateHz, maxSampleRateHz] range and would look broken
+    /// as a reset target. maxSampleRateHz resets to the same audible
+    /// no-op behaviour (applyRecordPath's own effectiveRateHz >=
+    /// hostSampleRateHz early-out), just expressed as a value inside
+    /// the visible range instead of the sentinel.
+    private func _defaultValue(for id: ParamID) -> Double? {
+        switch id {
+        case .transpose: return Double(_defaultParams.transposeSemitones)
+        case .bandwidth: return machineProfile.maxSampleRateHz
+        case .cutoff: return Double(_defaultParams.filterCutoff01)
+        case .resonance: return Double(_defaultParams.filterResonance01)
+        case .stretch: return Double(_defaultParams.timeFactorPercent)
+        case .cycle: return Double(_defaultParams.cycleLengthSamples)
+        case .quality: return Double(_defaultParams.quality)
+        case .width: return Double(_defaultParams.width)
+        }
     }
 
     /// One rack-panel knob -- see KnobCell.swift for the view itself.
@@ -709,6 +910,7 @@ struct ContentView: View {
         if recentFiles.count > maxRecentFiles {
             recentFiles.removeLast(recentFiles.count - maxRecentFiles)
         }
+        recentFilesStore.save(recentFiles)
     }
 
     /// Loads AKAIZER_AUTOLOAD_PATH on launch if set. Exists so the app's
@@ -763,7 +965,7 @@ struct ContentView: View {
                 // Copy synchronously, inside this closure -- url itself
                 // stops being valid the moment it returns.
                 let stagingDir = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("AkaizerS-Drop", isDirectory: true)
+                    .appendingPathComponent("Patina-Drop", isDirectory: true)
                     .appendingPathComponent(UUID().uuidString, isDirectory: true)
                 try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
                 let destination = stagingDir.appendingPathComponent(url.lastPathComponent)
@@ -784,7 +986,7 @@ struct ContentView: View {
         // would re-import the just-rendered copy as if it were a
         // brand-new sample.
         let dragTempDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("AkaizerS-Drag", isDirectory: true)
+            .appendingPathComponent("Patina-Drag", isDirectory: true)
         guard !url.path.hasPrefix(dragTempDir.path) else {
             return
         }
@@ -800,7 +1002,7 @@ struct ContentView: View {
     /// public.file-url). Worst case either way is a harmless leak in the
     /// OS temp dir until this runs again.
     private func _sweepDragExportTempFiles() {
-        for name in ["AkaizerS-Drag", "AkaizerS-Drop"] {
+        for name in ["Patina-Drag", "Patina-Drop"] {
             let dir = FileManager.default.temporaryDirectory.appendingPathComponent(name, isDirectory: true)
             try? FileManager.default.removeItem(at: dir)
         }
@@ -837,15 +1039,17 @@ struct ContentView: View {
 
     // -- stretch actions -----------------------------------------------------
 
-    /// Reads the ten parameter @State vars into one comparable/undoable
-    /// value. The single place both _currentParams() and every bulk-write
-    /// path (undo, revert, preset apply) read from or compare against.
+    /// Reads the eleven parameter @State vars into one comparable/
+    /// undoable value. The single place both _currentParams() and every
+    /// bulk-write path (undo, revert, preset apply) read from or compare
+    /// against.
     private func _snapshot() -> ParamSnapshot {
         ParamSnapshot(
             machine: selectedMachine, engine: selectedEngine, mode: selectedMode,
             stretchPercent: stretchPercent, cycleLength: cycleLength,
             quality: quality, width: width, transposeSemitones: transposeSemitones,
-            filterCutoff: filterCutoff, filterResonance: filterResonance
+            filterCutoff: filterCutoff, filterResonance: filterResonance,
+            sampleRateHz: sampleRateHz
         )
     }
 
@@ -946,6 +1150,7 @@ struct ContentView: View {
         transposeSemitones = defaults.transposeSemitones
         filterCutoff = defaults.filterCutoff
         filterResonance = defaults.filterResonance
+        sampleRateHz = defaults.sampleRateHz
         // S950 has no CYCLIC/INTELLIGENT switch at all (Mon1/Pol2
         // instead -- plan section 3.2). Force the picker back to a real
         // state rather than silently ignoring a stale "Intelligent"
@@ -953,18 +1158,24 @@ struct ContentView: View {
         if StretchProcessor.profile(for: machine).hasModeSwitch == 0 {
             selectedMode = AkzStretchMode_Cyclic
         }
-        if StretchProcessor.profile(for: machine).supportsTimeStretch == 0 {
-            isLiveAuditionOn = false // triggers its own onChange -> _stopLiveAudition()
-        } else {
-            _pushLiveParamsIfNeeded()
-        }
+        // Live audition stays running across a machine switch (v2
+        // heritage-roster plan, stage 11 fix) -- it used to force-stop
+        // for any non-stretch machine, under the same flawed assumption
+        // the Preview/Process buttons' old `!_stretchIsSupported` guard
+        // made: that a machine with no time-stretch has nothing worth
+        // previewing. Filter, transpose and (now) bandwidth all still
+        // apply and are all audible live; StretchEngine.cpp's own
+        // supportsTimeStretch gate makes sending it stretch params on
+        // such a machine harmless regardless.
+        _pushLiveParamsIfNeeded()
     }
 
-    /// Assigns all ten params from a snapshot in one shot -- undo restore,
-    /// revert, and preset apply all funnel through this. Assigning
-    /// selectedMachine directly here (never through _selectMachine) is
-    /// what keeps a bulk write from triggering the machine-change reset
-    /// above and clobbering the very values being restored.
+    /// Assigns all eleven params from a snapshot in one shot -- undo
+    /// restore, revert, and preset apply all funnel through this.
+    /// Assigning selectedMachine directly here (never through
+    /// _selectMachine) is what keeps a bulk write from triggering the
+    /// machine-change reset above and clobbering the very values being
+    /// restored.
     private func _applySnapshot(_ s: ParamSnapshot) {
         selectedMachine = s.machine
         selectedEngine = s.engine
@@ -976,6 +1187,7 @@ struct ContentView: View {
         transposeSemitones = s.transposeSemitones
         filterCutoff = s.filterCutoff
         filterResonance = s.filterResonance
+        sampleRateHz = s.sampleRateHz
         _pushLiveParamsIfNeeded()
     }
 
@@ -1027,7 +1239,7 @@ struct ContentView: View {
     /// "revert to original" means discarding the *edit state*, not
     /// restoring a file. Keeps the current machine (it's closer to a
     /// document mode than a parameter -- silently jumping to a different
-    /// sampler would be startling) and resets the other nine params to
+    /// sampler would be startling) and resets the other ten params to
     /// that machine's defaults, then discards the render. One undo step;
     /// undoing it restores the params but not the discarded render --
     /// that's the honest consequence of undo covering parameters only,
@@ -1166,6 +1378,32 @@ struct ContentView: View {
             let processedSample = LoadedSample(url: url, format: sample.format, rawData: rawData)
             try audioFileService.save(processedSample, to: url)
             statusMessage = "Saved processed audio to \(url.lastPathComponent)."
+        }
+    }
+
+    /// v2 heritage-roster plan, stage 11. Renders fresh from
+    /// _currentParams() -- the exact same params live audition is
+    /// already playing, by construction (both paths have always read
+    /// from this one function; see its own doc comment) -- so what
+    /// this saves is provably what's audible right now, not the last
+    /// offline Process() result Save Processed uses. Live audition
+    /// itself is never touched: rendering happens on a detached Task,
+    /// same pattern as ProcessedWavExport's drag-out export, and the
+    /// result is adopted as the new processedChannels (so Play
+    /// Processed/Save Processed/the waveform overlay all pick it up
+    /// too) before reusing saveProcessed()'s own save-panel flow.
+    private func _saveWhatImHearing() {
+        guard let sample = loadedSample else { return }
+        let snapshot = _snapshot()
+        let params = snapshot.params
+        Task {
+            let channels = await Task.detached(priority: .userInitiated) {
+                ProcessedRender.render(sample: sample, params: params)
+            }.value
+            processedChannels = channels
+            processedWaveformSamples = channels.first
+            renderedSnapshot = snapshot
+            saveProcessed()
         }
     }
 

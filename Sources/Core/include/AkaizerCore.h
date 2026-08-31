@@ -27,8 +27,15 @@ extern "C" {
 // Machines
 // ---------------------------------------------------------------------------
 
-// The Akai samplers this app models. S900 has no time-stretch capability
-// (added in the S950) but is included for converter/filter character.
+// The heritage samplers this app models. v1 was Akai-only (S900 has no
+// time-stretch capability, added in the S950, but is included for
+// converter/filter character); v2's heritage-roster plan adds four
+// non-Akai machines, none of which have time-stretch at all -- they
+// earn their place through converter, filter, varispeed and sample-
+// rate/bandwidth character instead. Append-only, NEVER renumbered --
+// PresetStore.swift's v1 migration table maps old raw values to stable
+// string ids that depend on this ordering never changing retroactively;
+// a genuinely new machine always goes immediately before AkzMachine_Count.
 typedef enum AkzMachine {
     AkzMachine_S900  = 0,
     AkzMachine_S950  = 1,
@@ -36,6 +43,10 @@ typedef enum AkzMachine {
     AkzMachine_S2000 = 3,
     AkzMachine_S3000 = 4,
     AkzMachine_S3200 = 5,
+    AkzMachine_SP1200      = 6, // E-mu SP-1200 (1987) -- fixed 26.04kHz, 12-bit linear, drop-sample (no interpolation)
+    AkzMachine_FairlightCmi2x = 7, // Fairlight CMI IIx (~1983) -- 8-bit linear, rate = 128 x pitch, pitch-tracking VCF
+    AkzMachine_Mirage      = 8, // Ensoniq Mirage (1984) -- 8-bit unsigned, phase-accumulator drop-sample, CEM3328 per-voice filter
+    AkzMachine_EmulatorII  = 9, // E-mu Emulator II (1984) -- 27.7kHz, AM6072 mu-law companding DAC, SSM2045 per-channel ladder filter
     AkzMachine_Count
 } AkzMachine;
 
@@ -55,6 +66,21 @@ typedef enum AkzEngine {
     AkzEngine_Revised = 1
 } AkzEngine;
 
+// Filter topology. Replaces v1's overloaded pair (filterHasResonance
+// picking a class, filterSlopeDbPerOctave >= 24.0 picking a stage count)
+// with an explicit selector, so FilterModel.cpp's factory dispatches on
+// a capability field rather than growing a third if-branch per new
+// machine family -- see FilterModel.h for what each topology models and
+// which real chips it stands in for.
+typedef enum AkzFilterTopology {
+    AkzFilterTopology_OnePoleCascade    = 0, // cascaded 1-pole lowpass stages, no resonance -- S900/S950 (analog SC Butterworth stand-in), S1000 (digital moving lowpass)
+    AkzFilterTopology_ChamberlinSvf     = 1, // naive Chamberlin SVF, k<=1.1 stability clamp -- v1/v2-stage2 S2000/S3000/S3200; superseded by TptSvf for these three from stage 6 on
+    AkzFilterTopology_TptSvf            = 2, // zero-delay-feedback SVF, unconditionally stable to Nyquist, unity passband gain by construction -- what S2000/S3000/S3200 migrate to
+    AkzFilterTopology_SsmLadder         = 3, // SSM2044/SSM2045-class 4-pole transistor ladder
+    AkzFilterTopology_CemStateVariable  = 4, // CEM3320/3328-class per-voice resonant state-variable filter
+    AkzFilterTopology_SwitchedCapacitor = 5  // switched-capacitor LPF/HPF pair (e.g. Fairlight's input anti-alias stage)
+} AkzFilterTopology;
+
 // ---------------------------------------------------------------------------
 // Machine profile — read-only per-machine constants
 // ---------------------------------------------------------------------------
@@ -62,22 +88,90 @@ typedef enum AkzEngine {
 typedef struct AkzMachineProfile {
     const char* name;                 // e.g. "S950"
 
+    // Stable identifier, e.g. "akai.s950" -- what presets store on disk
+    // (PresetStore.swift's AkaizerPreset.machineId), so that renumbering
+    // or reordering AkzMachine never remaps a saved preset to a
+    // different machine. Never renamed once shipped, same discipline as
+    // AkzMachine itself never being renumbered.
+    const char* stableId;
+
+    // Roster metadata (v2 heritage-roster plan, stage 9) -- grouping/
+    // sorting for the sidebar's machine browser, once the roster grows
+    // past a flat picker. Display-only; no DSP reads these.
+    const char* manufacturer;  // e.g. "Akai", "E-mu", "Roland", "Fairlight", "Ensoniq"
+    int         yearIntroduced;
+
     // Sample rate. S900/S950 are continuously variable via an audio
-    // bandwidth control (fs = bandwidth * 2.5); S1000 and later are fixed
-    // to one of a small set of rates. minSampleRateHz == maxSampleRateHz
-    // for the fixed-rate machines.
+    // bandwidth control (fs = bandwidth * 2.5); S1000 and later select
+    // between exactly two fixed rates (22050/44100 Hz), captured here as
+    // the same [min, max] pair even though the real hardware has nothing
+    // playable in between -- RateModel.cpp's resolveSampleRateHz() clamps
+    // a requested rate into this range without knowing (or enforcing)
+    // that distinction, a known simplification, not a citation that
+    // continuous values between them are real. minSampleRateHz ==
+    // maxSampleRateHz only for a genuinely single-fixed-rate machine
+    // (none of the current six -- watch for this when adding one that IS).
     double minSampleRateHz;
     double maxSampleRateHz;
-    int    hasVariableSampleRate;     // 1 for S900/S950, 0 otherwise
+    int    hasVariableSampleRate;     // 1 for S900/S950 (continuous), 0 for a discrete choice (S1000 and later) -- a UI hint (knob vs picker), not read by RateModel itself
+
+    // Anti-alias filter, the ADC-side stage RateModel.cpp's
+    // applyRecordPath runs before decimating to a rate below hostRateHz.
+    // Modelled as a tracking filter (cutoff = target rate *
+    // aaFilterCutoffRatio) rather than a fixed Hz value, matching how
+    // the real S900/S950 bandwidth control is documented to move the
+    // input filter and the sample clock together -- see MachineProfile.cpp
+    // for what's cited vs inferred per machine. 0.5 = cutoff sits exactly
+    // at the new Nyquist (little foldover); higher values leave the
+    // cutoff above Nyquist, letting content above it fold back down --
+    // that "deficiency" is real character on a cheap ADC, not a bug.
+    double aaFilterCutoffRatio;
+    int    aaFilterPoles;             // one-pole-cascade pole count approximating the real filter's slope, same non-precision-Butterworth caveat as FilterModel.h
 
     // Converter
     int    bitDepth;                  // 12 for S900/S950, 16 for S1000/S2000/S3000, 16 or 18 for S3200
     int    companded;                 // always 0 — none of these machines compand
 
-    // Filter
+    // Filter. filterHasResonance is a UI/capability flag ("does this
+    // machine expose a resonance knob") -- FilterModel.cpp's dispatch
+    // itself switches on filterTopology, not this flag, since a third
+    // topology could have resonance without being a ChamberlinSvf/
+    // TptSvf. filterSlopeDbPerOctave keeps its literal meaning (used
+    // directly as pole count for OnePoleCascade; documentation-only for
+    // the other topologies, whose pole count is a property of the real
+    // chip, not a tunable). filterStageCount replaces the old
+    // ">= 24.0 dB/oct" heuristic for S3200's second series SVF stage.
     int    filterHasResonance;        // 0 for S900/S950/S1000, 1 for S2000/S3000/S3200
     double filterSlopeDbPerOctave;    // 36 analog (S900/S950), 18 digital (S1000), 12 digital SVF (S2000/S3000), 24 (S3200 w/ 2nd filter)
     int    filterTracksPitch;         // 1 only for S900/S950 (per-voice analog filter clocked with the voice)
+    AkzFilterTopology filterTopology; // which class FilterModel.cpp's factory instantiates
+    int    filterStageCount;          // stages of filterTopology run in series (2 for S3200's "2nd DIGITAL FILTER" -> 24dB/oct, 1 otherwise)
+
+    // Resonant-peak compensation for AkzFilterTopology_TptSvf (v2
+    // heritage-roster plan, "SVF fix" stage). [I] -- no manual specifies
+    // this; it exists to fix the passband-gain clipping that
+    // ChamberlinSvf's k <= 1.1 stability clamp left behind. 0 = no
+    // compensation (the resonant peak, a real and kept characteristic,
+    // passes through at full height, closer to hardware that itself
+    // gets louder at resonance); 1 = full compensation (output peak
+    // held at unity even at maximum resonance, closer to hardware with
+    // its own internal limiting). Ignored for every other topology.
+    double filterResonanceCompensation01;
+
+    // DAC back end (v2 heritage-roster plan, stage 5 -- RateModel.cpp's
+    // applyDacPath). 1 when the machine's D/A conversion clock is the
+    // SAME clock that sets pitch (S900/S950 -- "per-voice DAC clock is
+    // varied directly," the same physical fact filterTracksPitch already
+    // captures for these two); 0 when conversion runs at a fixed
+    // native-rate clock regardless of transpose (S1000's "fixed passive
+    // LC reconstruction... not by pitch," S2000/S3000/S3200's "runs at
+    // fixed 44.1kHz after pitch interpolation on the real chip" -- see
+    // FilterModel.h). A separate field from filterTracksPitch on
+    // purpose, not just a rename of it: the two happen to agree for
+    // every machine here (one physical clock, two consequences), but a
+    // future machine could plausibly have its VCF and its DAC clock
+    // behave differently.
+    int    dacClockTracksPitch;
 
     // Transposition / interpolation. See MachineProfile.cpp for citations.
     int    interpolatorOrder;         // 0 = none (S900/S950 vary the DAC clock directly), 1 = zero-order hold, 2 = linear
@@ -96,6 +190,53 @@ typedef struct AkzMachineProfile {
 // Returns the profile for a machine. The returned pointer is to static
 // storage and never needs to be freed.
 const AkzMachineProfile* akz_machine_profile(AkzMachine machine);
+
+// Number of machines in the roster -- AkzMachine_Count, exposed across
+// the C boundary so Swift's StretchProcessor.allMachines can be
+// (0..<akz_machine_count()) rather than a hand-maintained literal array
+// that has to be kept in sync with the enum by hand.
+size_t akz_machine_count(void);
+
+// ---------------------------------------------------------------------------
+// Provenance — is a modelled stage cited, or this project's inference?
+// ---------------------------------------------------------------------------
+//
+// v1 tracked this in source comments only (`[M]`/`[I]`/`[M/I]` tags in
+// MachineProfile.cpp). v2's fidelity bar is citation-first but allows
+// inference IF IT IS VISIBLE TO THE USER, not just to a reader of the
+// source -- this table is what the UI reads to show that (an inference
+// badge on a knob, a "modelled from..." panel). Every AkzMachine x
+// AkzStage pair has an entry, including AkzProvenanceLevel_Unmodelled
+// for a stage this build's DSP doesn't implement yet (e.g. Rate/Dac
+// before the heritage-roster plan's stage 4/5 land) -- enforced by a
+// completeness test in MachineProfileTests.cpp, not left to be missing.
+
+typedef enum AkzStage {
+    AkzStage_Rate         = 0, // sample-rate/bandwidth front end (decimate + reconstruct)
+    AkzStage_Converter    = 1, // bit-depth quantisation, companding, transfer curve
+    AkzStage_Filter       = 2, // the machine-appropriate VCF
+    AkzStage_Interpolator = 3, // transpose/varispeed interpolation kind
+    AkzStage_Stretch      = 4, // time-stretch algorithm (n/a on machines with none -- Unmodelled, correctly)
+    AkzStage_Dac          = 5, // DAC back end (zero-order hold + reconstruction filter)
+    AkzStage_Count
+} AkzStage;
+
+typedef enum AkzProvenanceLevel {
+    AkzProvenanceLevel_Measured    = 0, // this project measured the real hardware directly
+    AkzProvenanceLevel_Manual      = 1, // a service/owner's manual, datasheet, or MAME-confirmed behavioural reference states this directly
+    AkzProvenanceLevel_Inferred    = 2, // this project's own inference or approximation, flagged as such
+    AkzProvenanceLevel_Unmodelled  = 3  // not implemented by this build's DSP yet, regardless of citation quality
+} AkzProvenanceLevel;
+
+typedef struct AkzStageProvenance {
+    AkzProvenanceLevel level;
+    const char* note; // short human-readable citation or inference note, e.g. "S950 manual: fs = bandwidth * 2.5"
+} AkzStageProvenance;
+
+// Returns provenance for one machine/stage pair. Never NULL -- every
+// combination has an entry (see completeness test above). The returned
+// pointer is to static storage, like akz_machine_profile.
+const AkzStageProvenance* akz_machine_stage_provenance(AkzMachine machine, AkzStage stage);
 
 // ---------------------------------------------------------------------------
 // Stretch parameters
@@ -129,6 +270,19 @@ typedef struct AkzStretchParams {
     // (AkzMachineProfile.filterHasResonance == 0) -- see FilterModel.h.
     float filterCutoff01;
     float filterResonance01;
+
+    // Sample rate / bandwidth front end (heritage-roster plan v2, stage
+    // 3 schema -- the RateModel DSP itself lands in stage 4). 0.0 means
+    // "use the machine's own default" (profile.maxSampleRateHz for a
+    // fixed-rate machine; the manual-documented default bandwidth for a
+    // variable-rate one, e.g. the S950's own top bandwidth), resolved by
+    // whatever consumes this field rather than requiring every caller to
+    // already know the machine's range. A non-zero value is silently
+    // clamped into [minSampleRateHz, maxSampleRateHz] by that same
+    // resolution step. Appended (not inserted) so every existing
+    // AkzStretchParams literal in Swift keeps compiling positionally --
+    // see StretchBridge.swift.
+    float sampleRateHz;
 } AkzStretchParams;
 
 // Fills params with the machine's documented defaults.

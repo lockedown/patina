@@ -62,7 +62,8 @@ public final class StretchProcessor {
         var params = AkzStretchParams(
             machine: machine, engine: AkzEngine_Classic, mode: AkzStretchMode_Cyclic,
             timeFactorPercent: 100, cycleLengthSamples: 1000, quality: 10, width: 10,
-            transposeSemitones: 0, filterCutoff01: 1, filterResonance01: 0
+            transposeSemitones: 0, filterCutoff01: 1, filterResonance01: 0,
+            sampleRateHz: 0 // 0 = machine default -- see AkaizerCore.h
         )
         akz_stretch_params_default(machine, &params)
         return params
@@ -72,11 +73,58 @@ public final class StretchProcessor {
         akz_machine_profile(machine).pointee
     }
 
-    /// All machines in declaration order, for building a picker.
-    public static let allMachines: [AkzMachine] = [
-        AkzMachine_S900, AkzMachine_S950, AkzMachine_S1000,
-        AkzMachine_S2000, AkzMachine_S3000, AkzMachine_S3200,
+    /// All machines in declaration order, for building the roster
+    /// browser. Derived from akz_machine_count() (v2 heritage-roster
+    /// plan, stage 9) rather than a hand-maintained literal array --
+    /// adding a machine to the C enum is now enough on its own; nothing
+    /// on the Swift side has to be kept in sync by hand.
+    public static let allMachines: [AkzMachine] = (0..<akz_machine_count()).map { AkzMachine(rawValue: UInt32($0)) }
+
+    /// Reverse lookup for AkzMachineProfile.stableId -- what
+    /// AkaizerPreset.machineId stores on disk. Linear scan over six (soon
+    /// a dozen-plus) machines, called only on preset load/apply, never on
+    /// a hot path. An unrecognised id (a preset from a future build
+    /// naming a machine this one doesn't have) falls back to S950 rather
+    /// than crashing or producing a garbage enum -- see AkaizerPreset's
+    /// doc comment for why S950 specifically.
+    public static func machine(forStableId stableId: String) -> AkzMachine {
+        for machine in allMachines where profile(for: machine).stableIdString == stableId {
+            return machine
+        }
+        return AkzMachine_S950
+    }
+
+    /// The stages provenance is tracked for, in AkzStage's own order --
+    /// what the UI iterates to build a "modelled from..." panel.
+    public static let allStages: [AkzStage] = [
+        AkzStage_Rate, AkzStage_Converter, AkzStage_Filter,
+        AkzStage_Interpolator, AkzStage_Stretch, AkzStage_Dac,
     ]
+
+    /// Human-readable label for one stage, for provenance UI.
+    public static func label(for stage: AkzStage) -> String {
+        switch stage {
+        case AkzStage_Rate: return "Sample rate"
+        case AkzStage_Converter: return "Converter"
+        case AkzStage_Filter: return "Filter"
+        case AkzStage_Interpolator: return "Interpolator"
+        case AkzStage_Stretch: return "Time-stretch"
+        case AkzStage_Dac: return "DAC"
+        default: return "?"
+        }
+    }
+
+    /// Provenance for one machine/stage pair -- see AkaizerCore.h's
+    /// AkzStageProvenance. Never nil in practice (the C side guarantees
+    /// an entry for every pair, enforced by a completeness test), but
+    /// the pointer is still checked since it crosses the C boundary.
+    public static func provenance(for machine: AkzMachine, stage: AkzStage) -> (level: AkzProvenanceLevel, note: String) {
+        guard let entry = akz_machine_stage_provenance(machine, stage) else {
+            return (AkzProvenanceLevel_Unmodelled, "?")
+        }
+        let note = entry.pointee.note != nil ? String(cString: entry.pointee.note) : "?"
+        return (entry.pointee.level, note)
+    }
 }
 
 /// Owns one AkzRealtimePlayer -- the render-thread-safe player used for
@@ -146,5 +194,17 @@ public extension AkzMachineProfile {
     /// conversion.
     var displayName: String {
         name != nil ? String(cString: name) : "?"
+    }
+
+    /// Same storage/lifetime guarantee as `name` above. What
+    /// AkaizerPreset.machineId compares against.
+    var stableIdString: String {
+        stableId != nil ? String(cString: stableId) : "?"
+    }
+
+    /// Same storage/lifetime guarantee as `name` above. Roster-browser
+    /// grouping (v2 heritage-roster plan, stage 9) -- display only.
+    var manufacturerName: String {
+        manufacturer != nil ? String(cString: manufacturer) : "?"
     }
 }

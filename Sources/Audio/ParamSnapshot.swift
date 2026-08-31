@@ -28,11 +28,16 @@ public struct ParamSnapshot: Equatable {
     public var transposeSemitones: Double
     public var filterCutoff: Double
     public var filterResonance: Double
+    /// 0 = machine default -- see AkzStretchParams.sampleRateHz. No UI
+    /// control sets this yet (heritage-roster plan stage 4/9 add the
+    /// bandwidth knob); wired through now so that landing is additive.
+    public var sampleRateHz: Double
 
     public init(
         machine: AkzMachine, engine: AkzEngine, mode: AkzStretchMode,
         stretchPercent: Double, cycleLength: Double, quality: Double, width: Double,
-        transposeSemitones: Double, filterCutoff: Double, filterResonance: Double
+        transposeSemitones: Double, filterCutoff: Double, filterResonance: Double,
+        sampleRateHz: Double = 0
     ) {
         self.machine = machine
         self.engine = engine
@@ -44,6 +49,7 @@ public struct ParamSnapshot: Equatable {
         self.transposeSemitones = transposeSemitones
         self.filterCutoff = filterCutoff
         self.filterResonance = filterResonance
+        self.sampleRateHz = sampleRateHz
     }
 
     public init(params: AkzStretchParams) {
@@ -57,6 +63,7 @@ public struct ParamSnapshot: Equatable {
         transposeSemitones = Double(params.transposeSemitones)
         filterCutoff = Double(params.filterCutoff01)
         filterResonance = Double(params.filterResonance01)
+        sampleRateHz = Double(params.sampleRateHz)
     }
 
     public var params: AkzStretchParams {
@@ -68,7 +75,8 @@ public struct ParamSnapshot: Equatable {
             width: Int32(width),
             transposeSemitones: Float(transposeSemitones),
             filterCutoff01: Float(filterCutoff),
-            filterResonance01: Float(filterResonance)
+            filterResonance01: Float(filterResonance),
+            sampleRateHz: Float(sampleRateHz)
         )
     }
 

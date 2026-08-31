@@ -1,4 +1,4 @@
-// AkaizerSApp.swift
+// PatinaApp.swift
 //
 // App entry point. See ContentView.swift for what's actually implemented.
 //
@@ -25,7 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 @main
-struct AkaizerSApp: App {
+struct PatinaApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {

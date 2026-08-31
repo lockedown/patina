@@ -18,6 +18,7 @@
 // " smp") -- it only ever has to read back a plain, possibly re-typed,
 // number.
 
+import AkaizerAudio
 import SwiftUI
 
 struct KnobCell: View {

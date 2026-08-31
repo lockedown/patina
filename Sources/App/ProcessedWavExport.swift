@@ -76,7 +76,7 @@ struct ProcessedWavExport: Transferable {
         // promised file, so cleanup is a sweep on next launch (see
         // ContentView's .onAppear) rather than a delete-on-completion.
         let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("AkaizerS-Drag", isDirectory: true)
+            .appendingPathComponent("Patina-Drag", isDirectory: true)
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appendingPathComponent(fileName)
