@@ -15,10 +15,10 @@
 //      than a separate effect bolted on.
 
 #include "StretchEngine.h"
-#include "ConverterModel.h"
 #include "FilterModel.h"
 #include "Interpolator.h"
 #include "MachineProfile.h"
+#include "RateModel.h"
 
 #include <algorithm>
 #include <cmath>
@@ -293,15 +293,19 @@ void StretchEngine::_recompute() {
     _output.clear();
     _readPos = 0;
 
-    // Converter model (build order stage 6): re-quantise fresh from the
-    // untouched _source every time, to the CURRENT machine's bit depth --
-    // this models "what this file would sound like sampled into the
-    // machine at its native bit depth" (this app's whole premise), not a
-    // one-way bit-crush baked in permanently. See ConverterModel.h for
-    // what's deliberately not modelled yet (variable sample rate, DAC
-    // low-level distortion).
+    // Record path (v2 heritage-roster plan, stage 4 -- rate/bandwidth
+    // front end; build order stage 6's converter, folded into it): fresh
+    // from the untouched _source every time, to the CURRENT machine's
+    // sample rate AND bit depth -- this models "what this file would
+    // sound like sampled into the machine" (this app's whole premise),
+    // not a one-way bit-crush/decimate baked in permanently.
+    // resolveSampleRateHz's 0-means-host-rate sentinel is what keeps
+    // this a no-op for every preset/default that predates sampleRateHz
+    // -- see RateModel.h. See ConverterModel.h for what's still not
+    // modelled (companding, DAC low-level distortion -- stage 7).
     _quantizedSource = _source;
-    quantizeBuffer(_quantizedSource.data(), _quantizedSource.size(), machineProfile(_params.machine).bitDepth);
+    const double effectiveRateHz = resolveSampleRateHz(_params.machine, _params.sampleRateHz, _sampleRateHz);
+    applyRecordPath(_quantizedSource.data(), _quantizedSource.size(), _params.machine, effectiveRateHz, _sampleRateHz);
 
     const int cycleLength = std::max(kMinCycleLength, _params.cycleLengthSamples);
     // Defense in depth, not just a UI gate: a machine whose profile says

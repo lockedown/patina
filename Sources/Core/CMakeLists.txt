@@ -19,6 +19,8 @@ add_library(AkaizerCore STATIC
     ConverterModel.cpp
     FilterModel.h
     FilterModel.cpp
+    RateModel.h
+    RateModel.cpp
 )
 
 find_package(Threads REQUIRED)

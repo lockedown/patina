@@ -85,12 +85,31 @@ typedef struct AkzMachineProfile {
     const char* stableId;
 
     // Sample rate. S900/S950 are continuously variable via an audio
-    // bandwidth control (fs = bandwidth * 2.5); S1000 and later are fixed
-    // to one of a small set of rates. minSampleRateHz == maxSampleRateHz
-    // for the fixed-rate machines.
+    // bandwidth control (fs = bandwidth * 2.5); S1000 and later select
+    // between exactly two fixed rates (22050/44100 Hz), captured here as
+    // the same [min, max] pair even though the real hardware has nothing
+    // playable in between -- RateModel.cpp's resolveSampleRateHz() clamps
+    // a requested rate into this range without knowing (or enforcing)
+    // that distinction, a known simplification, not a citation that
+    // continuous values between them are real. minSampleRateHz ==
+    // maxSampleRateHz only for a genuinely single-fixed-rate machine
+    // (none of the current six -- watch for this when adding one that IS).
     double minSampleRateHz;
     double maxSampleRateHz;
-    int    hasVariableSampleRate;     // 1 for S900/S950, 0 otherwise
+    int    hasVariableSampleRate;     // 1 for S900/S950 (continuous), 0 for a discrete choice (S1000 and later) -- a UI hint (knob vs picker), not read by RateModel itself
+
+    // Anti-alias filter, the ADC-side stage RateModel.cpp's
+    // applyRecordPath runs before decimating to a rate below hostRateHz.
+    // Modelled as a tracking filter (cutoff = target rate *
+    // aaFilterCutoffRatio) rather than a fixed Hz value, matching how
+    // the real S900/S950 bandwidth control is documented to move the
+    // input filter and the sample clock together -- see MachineProfile.cpp
+    // for what's cited vs inferred per machine. 0.5 = cutoff sits exactly
+    // at the new Nyquist (little foldover); higher values leave the
+    // cutoff above Nyquist, letting content above it fold back down --
+    // that "deficiency" is real character on a cheap ADC, not a bug.
+    double aaFilterCutoffRatio;
+    int    aaFilterPoles;             // one-pole-cascade pole count approximating the real filter's slope, same non-precision-Butterworth caveat as FilterModel.h
 
     // Converter
     int    bitDepth;                  // 12 for S900/S950, 16 for S1000/S2000/S3000, 16 or 18 for S3200

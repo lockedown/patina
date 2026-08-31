@@ -39,6 +39,8 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* minSampleRateHz */         7500.0,
         /* maxSampleRateHz */         40000.0,          // bandwidth 3000-16000 Hz * 2.5 [M]
         /* hasVariableSampleRate */   1,
+        /* aaFilterCutoffRatio */     0.5,              // [I] -- inferred from the shared bandwidth-tracking design (filterTracksPitch), not itself a manual citation for the INPUT stage specifically
+        /* aaFilterPoles */           6,                // [I] -- assumed same order as the cited 36dB/oct output filter (same analog block per the bandwidth control's shared design)
         /* bitDepth */                12,               // 12-bit SAR, 12-bit packed storage [M]
         /* companded */               0,                // no mu-law step anywhere in the audio path
         /* filterHasResonance */      0,                // analog SC Butterworth, no resonance control [M]
@@ -61,6 +63,8 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* minSampleRateHz */         7500.0,
         /* maxSampleRateHz */         48000.0,          // bandwidth 3000-19200 Hz * 2.5, confirmed 3 ways in manual [M]
         /* hasVariableSampleRate */   1,
+        /* aaFilterCutoffRatio */     0.5,              // [I] -- inferred, see S900's identical note
+        /* aaFilterPoles */           6,                // [I] -- assumed same order as the cited 36dB/oct output filter
         /* bitDepth */                12,               // "12-bit sampling / 16-bit processing" [M]
         /* companded */               0,
         /* filterHasResonance */      0,                // analog SC Butterworth, no resonance control [M]
@@ -83,6 +87,8 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* minSampleRateHz */         22050.0,
         /* maxSampleRateHz */         44100.0,          // exactly two rates, no continuous variation [M]
         /* hasVariableSampleRate */   0,
+        /* aaFilterCutoffRatio */     0.5,              // [I] -- no manual citation for this specific stage; decimation is rarely exercised on a dual-fixed-rate machine
+        /* aaFilterPoles */           4,                // [I] -- generic placeholder, same caveat
         /* bitDepth */                16,               // "16-bit linear encoding" [M]
         /* companded */               0,
         /* filterHasResonance */      0,                // "no resonance control, and the filter cannot go into self-oscillation" [M]
@@ -105,6 +111,8 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* minSampleRateHz */         22050.0,
         /* maxSampleRateHz */         44100.0,
         /* hasVariableSampleRate */   0,
+        /* aaFilterCutoffRatio */     0.5,              // [I] -- no manual citation for this specific stage
+        /* aaFilterPoles */           4,                // [I] -- generic placeholder
         /* bitDepth */                16,
         /* companded */               0,
         /* filterHasResonance */      1,                // identical L7A1045 silicon to the S3000XL, resonant SVF -- manual-confirmed, contra common belief [M]
@@ -127,6 +135,8 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* minSampleRateHz */         22050.0,
         /* maxSampleRateHz */         44100.0,
         /* hasVariableSampleRate */   0,
+        /* aaFilterCutoffRatio */     0.5,              // [I] -- no manual citation for this specific stage
+        /* aaFilterPoles */           4,                // [I] -- generic placeholder
         /* bitDepth */                16,
         /* companded */               0,
         /* filterHasResonance */      1,                // same L7A1045 silicon as S2000 [M]
@@ -149,6 +159,8 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* minSampleRateHz */         22050.0,
         /* maxSampleRateHz */         44100.0,
         /* hasVariableSampleRate */   0,
+        /* aaFilterCutoffRatio */     0.5,              // [I] -- no manual citation for this specific stage
+        /* aaFilterPoles */           4,                // [I] -- generic placeholder
         /* bitDepth */                18,               // 18-bit converters on individual outs; stored data remains 16-bit [M/I]
         /* companded */               0,
         /* filterHasResonance */      1,                // primary L7A1045 filter, same as S2000/S3000

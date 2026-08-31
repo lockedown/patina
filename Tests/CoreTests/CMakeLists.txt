@@ -13,6 +13,7 @@ add_executable(AkaizerCoreTests
     ConverterModelTests.cpp
     FilterModelTests.cpp
     IntelligentModeTests.cpp
+    RateModelTests.cpp
 )
 
 target_link_libraries(AkaizerCoreTests PRIVATE AkaizerCore)

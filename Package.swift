@@ -37,7 +37,7 @@ let package = Package(
             name: "AkaizerCore",
             path: "Sources/Core",
             exclude: ["CMakeLists.txt"],
-            sources: ["MachineProfile.cpp", "StretchEngine.cpp", "RealtimeStretchPlayer.cpp", "Interpolator.cpp", "ConverterModel.cpp", "FilterModel.cpp"],
+            sources: ["MachineProfile.cpp", "StretchEngine.cpp", "RealtimeStretchPlayer.cpp", "Interpolator.cpp", "ConverterModel.cpp", "FilterModel.cpp", "RateModel.cpp"],
             publicHeadersPath: "include",
             cxxSettings: [.unsafeFlags(["-std=c++17"])]
         ),
