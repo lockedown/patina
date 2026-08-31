@@ -192,6 +192,75 @@ private:
     double _ic1eq = 0.0, _ic2eq = 0.0;
 };
 
+// A simplified digital model of a 4-pole transistor ladder filter
+// (Stilson & Smith, "Analyzing the Moog VCF with Considerations for
+// Digital Implementation," 1996) -- stands in for the SSM2044/SSM2045-
+// class ladder filters the heritage-roster research found on the
+// Emulator II (SSM2045, one per channel, manual-confirmed "4 pole
+// lowpass filter") and, optionally and NOT modelled here, the SP-1200
+// (SSM2044, a colour option on channels 1-2 only, not the main signal
+// path -- see MachineProfile.cpp). Four identical one-pole stages
+// inside a resonance feedback loop -- distinct in character from the
+// SVF topologies: capable of genuine self-oscillation, which for a
+// real transistor ladder is a desired, bounded character rather than
+// the unintentional divergence ChamberlinSVF's clamp existed to
+// prevent. The feedback path is soft-clipped (tanh) rather than left
+// linear specifically so the loop stays bounded at high resonance --
+// this is both a stability requirement (a linear ladder model WOULD
+// diverge past its own resonance boundary, the exact failure class
+// ChamberlinSVF hit) and a real modelling technique: a transistor
+// ladder's own saturation is what keeps its self-oscillation amplitude
+// bounded in the first place, not a separate limiter bolted on.
+class SsmLadder : public IFilterStage {
+public:
+    SsmLadder(double cutoffHz, int resonanceCode, double sampleRateHz, double resonanceCompensation01) {
+        const double clampedCutoff = std::min(cutoffHz, sampleRateHz * 0.49);
+        _g = 1.0 - std::exp(-2.0 * M_PI * clampedCutoff / sampleRateHz);
+
+        // 0..15 -> 0..4.0 feedback amount -- this project's own curve
+        // [I], same status as ChamberlinSVF/TptSvf's damping mappings.
+        // 4.0 is the classic Moog self-oscillation boundary for 4
+        // identical one-pole stages (each contributes ~-90 degrees at
+        // cutoff; 4 poles = -360 degrees, satisfying the Barkhausen
+        // criterion at unity feedback gain).
+        const int clampedRes = std::max(0, std::min(15, resonanceCode));
+        _resonanceAmount = 4.0 * (static_cast<double>(clampedRes) / 15.0);
+
+        // Passband-gain compensation, same rationale/formula as TptSvf
+        // -- peakGain approximated from the resonance amount rather
+        // than derived analytically (the tanh nonlinearity makes an
+        // exact closed form impractical); [I].
+        const double peakGain = std::max(1.0, 1.0 + _resonanceAmount * 0.9);
+        _inputScale = 1.0 / (1.0 + resonanceCompensation01 * (peakGain - 1.0));
+    }
+
+    float process(float x) override {
+        const double feedback = std::tanh(_resonanceAmount * _stage[3]);
+        double v = static_cast<double>(x) * _inputScale - feedback;
+        for (int i = 0; i < 4; ++i) {
+            _stage[i] += _g * (v - _stage[i]);
+            v = _stage[i];
+        }
+
+        // Hard safety backstop, same discipline as ChamberlinSVF's --
+        // no input should ever make this filter emit non-finite values,
+        // regardless of how thoroughly the tanh soft-clip above has
+        // been swept.
+        constexpr double kStateLimit = 100.0;
+        for (double& s : _stage) {
+            s = std::max(-kStateLimit, std::min(kStateLimit, s));
+        }
+
+        return static_cast<float>(_stage[3]);
+    }
+
+private:
+    double _g = 0.0;
+    double _resonanceAmount = 0.0;
+    double _inputScale = 1.0;
+    double _stage[4] = {0.0, 0.0, 0.0, 0.0};
+};
+
 // Instantiates one stage of `topology`. `poles` is only meaningful for
 // OnePoleCascade (each other topology's pole count is a property of the
 // real chip, not a per-call parameter); `resonanceCode`/
@@ -203,13 +272,26 @@ std::unique_ptr<IFilterStage> makeFilterStage(AkzFilterTopology topology, double
         case AkzFilterTopology_ChamberlinSvf:
             return std::make_unique<ChamberlinSVF>(cutoffHz, resonanceCode, sampleRateHz);
         case AkzFilterTopology_TptSvf:
+        // CemStateVariable (Fairlight's CEM3320/SSM2045-era VCF, Mirage's
+        // CEM3328) is modelled with the same TptSvf math, not a separate
+        // class -- both real chips are commonly modelled as resonant
+        // state-variable filters, and this project already has one that
+        // is unconditionally stable. filterStageCount == 2 (two 2-pole
+        // stages in series, same technique as S3200's 24dB/oct mode) is
+        // how CEM3328's cited 4-pole/24dB spec is reached -- see
+        // MachineProfile.cpp.
+        case AkzFilterTopology_CemStateVariable:
             return std::make_unique<TptSvf>(cutoffHz, resonanceCode, sampleRateHz, resonanceCompensation01);
+        case AkzFilterTopology_SsmLadder:
+            return std::make_unique<SsmLadder>(cutoffHz, resonanceCode, sampleRateHz, resonanceCompensation01);
         case AkzFilterTopology_OnePoleCascade:
-        // SsmLadder/CemStateVariable/SwitchedCapacitor land with the
-        // machines that need them (heritage-roster plan stage 10) --
+        // SwitchedCapacitor lands if a machine ever needs it modelled as
+        // its OWN output-filter topology (Fairlight's citation is for an
+        // INPUT anti-alias stage, already covered by RateModel's
+        // aaFilterCutoffRatio/aaFilterPoles, not this factory) --
         // falling through to OnePoleCascade rather than silently
         // misrendering is a deliberate placeholder, not a real choice
-        // for any of those topologies' actual character.
+        // for its actual character.
         default:
             return std::make_unique<OnePoleLowpassCascade>(poles, cutoffHz, sampleRateHz);
     }

@@ -27,8 +27,15 @@ extern "C" {
 // Machines
 // ---------------------------------------------------------------------------
 
-// The Akai samplers this app models. S900 has no time-stretch capability
-// (added in the S950) but is included for converter/filter character.
+// The heritage samplers this app models. v1 was Akai-only (S900 has no
+// time-stretch capability, added in the S950, but is included for
+// converter/filter character); v2's heritage-roster plan adds four
+// non-Akai machines, none of which have time-stretch at all -- they
+// earn their place through converter, filter, varispeed and sample-
+// rate/bandwidth character instead. Append-only, NEVER renumbered --
+// PresetStore.swift's v1 migration table maps old raw values to stable
+// string ids that depend on this ordering never changing retroactively;
+// a genuinely new machine always goes immediately before AkzMachine_Count.
 typedef enum AkzMachine {
     AkzMachine_S900  = 0,
     AkzMachine_S950  = 1,
@@ -36,6 +43,10 @@ typedef enum AkzMachine {
     AkzMachine_S2000 = 3,
     AkzMachine_S3000 = 4,
     AkzMachine_S3200 = 5,
+    AkzMachine_SP1200      = 6, // E-mu SP-1200 (1987) -- fixed 26.04kHz, 12-bit linear, drop-sample (no interpolation)
+    AkzMachine_FairlightCmi2x = 7, // Fairlight CMI IIx (~1983) -- 8-bit linear, rate = 128 x pitch, pitch-tracking VCF
+    AkzMachine_Mirage      = 8, // Ensoniq Mirage (1984) -- 8-bit unsigned, phase-accumulator drop-sample, CEM3328 per-voice filter
+    AkzMachine_EmulatorII  = 9, // E-mu Emulator II (1984) -- 27.7kHz, AM6072 mu-law companding DAC, SSM2045 per-channel ladder filter
     AkzMachine_Count
 } AkzMachine;
 

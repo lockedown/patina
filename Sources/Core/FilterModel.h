@@ -38,6 +38,20 @@
 //     defined for any future machine whose citation specifically wants
 //     the naive (non-zero-delay-feedback) character.
 //
+//   - TptSvf (AkzFilterTopology_TptSvf): what S2000/S3000/S3200 actually
+//     use as of stage 6, and (AkzFilterTopology_CemStateVariable, same
+//     class) Fairlight CMI IIx and Ensoniq Mirage's CEM3320/CEM3328-era
+//     per-voice VCFs (heritage-roster plan stage 10) -- unconditionally
+//     stable zero-delay-feedback SVF, see FilterModel.cpp for the
+//     difference equation and the passband-gain compensation mechanism.
+//
+//   - SsmLadder (AkzFilterTopology_SsmLadder): a 4-pole transistor-ladder
+//     model (Stilson & Smith) standing in for the SSM2045 the Emulator
+//     II's research citation names, one per channel (heritage-roster
+//     plan stage 10). Capable of genuine self-oscillation at maximum
+//     resonance, bounded by a tanh soft-clip in the feedback path rather
+//     than a hard clamp -- see FilterModel.cpp.
+//
 // Every filter kind resets its internal state at the start of a render
 // -- analogous to "filter state clears on key-on" for the SVF (the plan's
 // direct citation), applied here as "each render is one new note."

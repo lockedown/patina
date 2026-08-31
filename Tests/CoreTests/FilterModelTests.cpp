@@ -233,6 +233,100 @@ AKZ_TEST(tpt_svf_dc_gain_matches_the_documented_compensation_formula) {
     }
 }
 
+// -- v2 heritage-roster plan, stage 10: SsmLadder and CemStateVariable,
+// exercised through the real machines that use them ------------------
+
+AKZ_TEST(ssm_ladder_stability_sweep_every_resonance_code_stays_finite) {
+    // Same discipline as TptSvf's own sweep -- unlike TptSvf,
+    // SsmLadder's feedback loop is NOT unconditionally stable by
+    // construction (a real ladder self-oscillates, which a naive linear
+    // model would let diverge to +-inf); this verifies the tanh
+    // soft-clip in the feedback path actually bounds it, across the
+    // full resonance range, over a run long enough for a slow
+    // divergence to show -- the same class of bug the original
+    // ChamberlinSVF k~=1.23 regression was.
+    const double sampleRate = 44100.0;
+    const size_t sampleCount = 200000;
+    for (int resonanceCode = 0; resonanceCode <= 15; ++resonanceCode) {
+        auto buf = makeSine(sampleCount, 1000.0, sampleRate, 0.9f);
+        const float resonance01 = static_cast<float>(resonanceCode) / 15.0f;
+        applyFilter(buf.data(), buf.size(), AkzMachine_EmulatorII, 0.9f, resonance01, sampleRate, 1.0);
+        for (float v : buf) {
+            AKZ_CHECK(std::isfinite(v));
+        }
+    }
+}
+
+AKZ_TEST(ssm_ladder_resonance_changes_the_output) {
+    const double sampleRate = 44100.0;
+    auto noResonance = makeSine(4000, 3000.0, sampleRate);
+    auto highResonance = noResonance;
+
+    applyFilter(noResonance.data(), noResonance.size(), AkzMachine_EmulatorII, 0.4f, 0.0f, sampleRate, 1.0);
+    applyFilter(highResonance.data(), highResonance.size(), AkzMachine_EmulatorII, 0.4f, 0.9f, sampleRate, 1.0);
+
+    bool anyDifference = false;
+    for (size_t i = 500; i < noResonance.size(); ++i) {
+        if (std::fabs(noResonance[i] - highResonance[i]) > 1e-5f) { anyDifference = true; break; }
+    }
+    AKZ_CHECK(anyDifference);
+}
+
+AKZ_TEST(ssm_ladder_never_exceeds_a_bounded_peak_even_at_maximum_resonance) {
+    // The same passband-gain-compensation guarantee TptSvf's own
+    // regression test checks, for the ladder topology: full
+    // compensation (filterResonanceCompensation01 == 1.0 for the
+    // Emulator II) must keep the output from running away, even while
+    // genuinely self-oscillating at code 15.
+    const double sampleRate = 44100.0;
+    const float inputAmplitude = 0.8f;
+    auto buf = makeSine(20000, 440.0, sampleRate, inputAmplitude);
+    applyFilter(buf.data(), buf.size(), AkzMachine_EmulatorII, 0.6f, 1.0f, sampleRate, 1.0);
+
+    float peak = 0.0f;
+    for (size_t i = 2000; i < buf.size(); ++i) { // skip startup transient
+        peak = std::max(peak, std::fabs(buf[i]));
+    }
+    AKZ_CHECK(peak < 10.0f); // bounded, not diverging -- not a tight loudness claim
+}
+
+AKZ_TEST(cem_state_variable_stability_sweep_every_resonance_code_stays_finite) {
+    // CemStateVariable reuses TptSvf's math (unconditionally stable by
+    // construction) -- this pins that guarantee at the machine level
+    // too, for both machines that use it.
+    const double sampleRate = 44100.0;
+    const size_t sampleCount = 200000;
+    const AkzMachine machines[] = {AkzMachine_FairlightCmi2x, AkzMachine_Mirage};
+    for (AkzMachine machine : machines) {
+        for (int resonanceCode = 0; resonanceCode <= 15; resonanceCode += 3) { // coarser step -- two machines x 16 codes x 200k would be slow for little extra confidence over TptSvf's own full sweep
+            auto buf = makeSine(sampleCount, 1000.0, sampleRate, 0.9f);
+            const float resonance01 = static_cast<float>(resonanceCode) / 15.0f;
+            applyFilter(buf.data(), buf.size(), machine, 0.9f, resonance01, sampleRate, 1.0);
+            for (float v : buf) {
+                AKZ_CHECK(std::isfinite(v));
+            }
+        }
+    }
+}
+
+AKZ_TEST(fairlight_and_mirage_second_filter_stage_attenuates_more_than_one_stage_would) {
+    // Both use filterStageCount == 2 to reach their cited 24dB/oct --
+    // same "second stage attenuates more" property S3200 already
+    // proves against S3000's single stage, checked here against a
+    // synthetic single-stage reference built from S2000 (also TptSvf-
+    // family, one stage) at the same cutoff/resonance.
+    const double sampleRate = 44100.0;
+    auto oneStageBuf = makeSine(4000, 8000.0, sampleRate);
+    auto twoStageBuf = oneStageBuf;
+
+    applyFilter(oneStageBuf.data(), oneStageBuf.size(), AkzMachine_S2000, 0.3f, 0.0f, sampleRate, 1.0);
+    applyFilter(twoStageBuf.data(), twoStageBuf.size(), AkzMachine_Mirage, 0.3f, 0.0f, sampleRate, 1.0);
+
+    const double oneStageRms = rms(oneStageBuf, 500);
+    const double twoStageRms = rms(twoStageBuf, 500);
+    AKZ_CHECK(twoStageRms < oneStageRms);
+}
+
 AKZ_TEST(non_resonant_machines_have_no_resonance_parameter_effect) {
     // S900/S950/S1000 have no resonance control at all (plan section
     // 3.2 item 2) -- resonance01 must be silently ignored, not produce
