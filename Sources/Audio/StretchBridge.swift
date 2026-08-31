@@ -77,6 +77,20 @@ public final class StretchProcessor {
         AkzMachine_S900, AkzMachine_S950, AkzMachine_S1000,
         AkzMachine_S2000, AkzMachine_S3000, AkzMachine_S3200,
     ]
+
+    /// Reverse lookup for AkzMachineProfile.stableId -- what
+    /// AkaizerPreset.machineId stores on disk. Linear scan over six (soon
+    /// a dozen-plus) machines, called only on preset load/apply, never on
+    /// a hot path. An unrecognised id (a preset from a future build
+    /// naming a machine this one doesn't have) falls back to S950 rather
+    /// than crashing or producing a garbage enum -- see AkaizerPreset's
+    /// doc comment for why S950 specifically.
+    public static func machine(forStableId stableId: String) -> AkzMachine {
+        for machine in allMachines where profile(for: machine).stableIdString == stableId {
+            return machine
+        }
+        return AkzMachine_S950
+    }
 }
 
 /// Owns one AkzRealtimePlayer -- the render-thread-safe player used for
@@ -146,5 +160,11 @@ public extension AkzMachineProfile {
     /// conversion.
     var displayName: String {
         name != nil ? String(cString: name) : "?"
+    }
+
+    /// Same storage/lifetime guarantee as `name` above. What
+    /// AkaizerPreset.machineId compares against.
+    var stableIdString: String {
+        stableId != nil ? String(cString: stableId) : "?"
     }
 }

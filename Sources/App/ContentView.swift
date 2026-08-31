@@ -102,8 +102,8 @@ struct ContentView: View {
 
     /// Most-recently-opened files, newest first, capped -- a quick-switch
     /// jump list for the sidebar, not the batch queue the plan
-    /// explicitly ruled out. Session-only for now; stage 9 (presets) may
-    /// give this real persistence.
+    /// explicitly ruled out. Persisted via RecentFilesStore since v2
+    /// (was session-only in v1).
     @State private var recentFiles: [URL] = []
     private let maxRecentFiles = 8
 
@@ -120,6 +120,7 @@ struct ContentView: View {
     private let audioFileService = AudioFileService()
     private let playback = AudioPlaybackController()
     private let presetStore = PresetStore()
+    private let recentFilesStore = RecentFilesStore(maxCount: 8)
 
     private var machineProfile: AkzMachineProfile {
         StretchProcessor.profile(for: selectedMachine)
@@ -240,7 +241,12 @@ struct ContentView: View {
             }
         }
         .onAppear {
-            presets = presetStore.load()
+            let (loadedPresets, presetError) = presetStore.loadOrRecover()
+            presets = loadedPresets
+            recentFiles = recentFilesStore.load()
+            if let presetError {
+                statusMessage = presetError
+            }
             playback.onFinished = { isPlayingOffline = false }
             _autoloadIfRequested()
             _sweepDragExportTempFiles()
@@ -709,6 +715,7 @@ struct ContentView: View {
         if recentFiles.count > maxRecentFiles {
             recentFiles.removeLast(recentFiles.count - maxRecentFiles)
         }
+        recentFilesStore.save(recentFiles)
     }
 
     /// Loads AKAIZER_AUTOLOAD_PATH on launch if set. Exists so the app's

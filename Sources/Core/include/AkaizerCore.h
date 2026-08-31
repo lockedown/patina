@@ -62,6 +62,13 @@ typedef enum AkzEngine {
 typedef struct AkzMachineProfile {
     const char* name;                 // e.g. "S950"
 
+    // Stable identifier, e.g. "akai.s950" -- what presets store on disk
+    // (PresetStore.swift's AkaizerPreset.machineId), so that renumbering
+    // or reordering AkzMachine never remaps a saved preset to a
+    // different machine. Never renamed once shipped, same discipline as
+    // AkzMachine itself never being renumbered.
+    const char* stableId;
+
     // Sample rate. S900/S950 are continuously variable via an audio
     // bandwidth control (fs = bandwidth * 2.5); S1000 and later are fixed
     // to one of a small set of rates. minSampleRateHz == maxSampleRateHz

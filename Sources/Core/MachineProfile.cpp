@@ -24,6 +24,7 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
     // AkzMachine_S900
     {
         /* name */                    "S900",
+        /* stableId */                "akai.s900",
         /* minSampleRateHz */         7500.0,
         /* maxSampleRateHz */         40000.0,          // bandwidth 3000-16000 Hz * 2.5 [M]
         /* hasVariableSampleRate */   1,
@@ -43,6 +44,7 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
     // AkzMachine_S950
     {
         /* name */                    "S950",
+        /* stableId */                "akai.s950",
         /* minSampleRateHz */         7500.0,
         /* maxSampleRateHz */         48000.0,          // bandwidth 3000-19200 Hz * 2.5, confirmed 3 ways in manual [M]
         /* hasVariableSampleRate */   1,
@@ -62,6 +64,7 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
     // AkzMachine_S1000
     {
         /* name */                    "S1000",
+        /* stableId */                "akai.s1000",
         /* minSampleRateHz */         22050.0,
         /* maxSampleRateHz */         44100.0,          // exactly two rates, no continuous variation [M]
         /* hasVariableSampleRate */   0,
@@ -81,6 +84,7 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
     // AkzMachine_S2000
     {
         /* name */                    "S2000",
+        /* stableId */                "akai.s2000",
         /* minSampleRateHz */         22050.0,
         /* maxSampleRateHz */         44100.0,
         /* hasVariableSampleRate */   0,
@@ -100,6 +104,7 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
     // AkzMachine_S3000
     {
         /* name */                    "S3000",
+        /* stableId */                "akai.s3000",
         /* minSampleRateHz */         22050.0,
         /* maxSampleRateHz */         44100.0,
         /* hasVariableSampleRate */   0,
@@ -119,6 +124,7 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
     // AkzMachine_S3200
     {
         /* name */                    "S3200",
+        /* stableId */                "akai.s3200",
         /* minSampleRateHz */         22050.0,
         /* maxSampleRateHz */         44100.0,
         /* hasVariableSampleRate */   0,
