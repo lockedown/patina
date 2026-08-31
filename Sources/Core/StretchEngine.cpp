@@ -384,6 +384,25 @@ void StretchEngine::_recompute() {
         _output = resample(_output.data(), _output.size(), transposeRatio, kind);
     }
 
+    // DAC back end (v2 heritage-roster plan, stage 5): the digital
+    // signal, played back through a real DAC clocked at the machine's
+    // rate, holds each sample for one DAC-clock period before the next
+    // -- a distinct artifact from Interpolator's own source-side
+    // zero-order-hold pitch resampling above (which picks WHICH stored
+    // sample plays; this is about what the OUTPUT looks like once it
+    // does). Runs AFTER transpose, BEFORE the pre-filter cache point, so
+    // a live-audition filter-only change (reapplyFilterOnly) inherits
+    // this for free instead of needing to redo it. Only tracks pitch on
+    // a machine whose physical DAC clock genuinely is the pitch clock
+    // (dacClockTracksPitch -- S900/S950); everything else converts at a
+    // fixed native rate regardless of transpose, per FilterModel.h's own
+    // citations for why their VCF doesn't track pitch either.
+    if (!_output.empty()) {
+        const AkzMachineProfile& dacProfile = machineProfile(_params.machine);
+        const double playbackRateHz = dacProfile.dacClockTracksPitch ? effectiveRateHz * transposeRatio : effectiveRateHz;
+        applyDacPath(_output.data(), _output.size(), _params.machine, playbackRateHz, _sampleRateHz);
+    }
+
     // Cached here, before the filter runs, so reapplyFilterOnly() can redo
     // just the last stage when a live-audition change turns out to be
     // filter-only (see paramsDifferOnlyInFilter()) instead of re-running

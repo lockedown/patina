@@ -48,6 +48,7 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* filterTracksPitch */       1,                // per-voice MF6CN-50 clocked with the voice [M/I]
         /* filterTopology */          AkzFilterTopology_OnePoleCascade,
         /* filterStageCount */        1,
+        /* dacClockTracksPitch */     1,                // per-voice DAC clock is varied directly -- same physical clock as filterTracksPitch [M/I]
         /* interpolatorOrder */       0,                // no interpolation -- per-voice DAC clock is varied directly [I]
         /* supportsTimeStretch */     0,                // added in the S950; S900 has none [M]
         /* maxStretchPercent */       0.0,
@@ -72,6 +73,7 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* filterTracksPitch */       1,                // MF6CN-50 per voice, clock-tracked [M/I]
         /* filterTopology */          AkzFilterTopology_OnePoleCascade,
         /* filterStageCount */        1,
+        /* dacClockTracksPitch */     1,                // same physical clock as filterTracksPitch [M/I]
         /* interpolatorOrder */       0,                // no interpolation -- per-voice DAC clock varied directly [I]
         /* supportsTimeStretch */     1,
         /* maxStretchPercent */       999.0,            // "Timestretch (up to 999%)" [M]
@@ -96,6 +98,7 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* filterTracksPitch */       0,                // fixed passive LC reconstruction, switched 10/20 kHz by rate, not by pitch [M]
         /* filterTopology */          AkzFilterTopology_OnePoleCascade,
         /* filterStageCount */        1,
+        /* dacClockTracksPitch */     0,                // "fixed passive LC reconstruction... not by pitch" -- same citation as filterTracksPitch [M]
         /* interpolatorOrder */       2,                // order unstated by Akai; linear assumed pending by-ear revision -- see plan "Known gaps" [I]
         /* supportsTimeStretch */     1,                // added in OS 2.0 [M]
         /* maxStretchPercent */       2000.0,           // "25% of its original length to 2000%" [M]
@@ -120,6 +123,7 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* filterTracksPitch */       0,                // runs at fixed 44.1kHz after pitch interpolation [M/I from MAME device]
         /* filterTopology */          AkzFilterTopology_ChamberlinSvf, // superseded by TptSvf from v2 stage 6 on -- see AkaizerCore.h
         /* filterStageCount */        1,
+        /* dacClockTracksPitch */     0,                // "runs at fixed 44.1kHz after pitch interpolation" -- same citation as filterTracksPitch [M/I]
         /* interpolatorOrder */       1,                // zero-order hold, per MAME l7a1045_l6028_dsp_a.cpp: frac bits discarded when addressing [I, best available evidence]
         /* supportsTimeStretch */     1,
         /* maxStretchPercent */       2000.0,
@@ -144,6 +148,7 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* filterTracksPitch */       0,
         /* filterTopology */          AkzFilterTopology_ChamberlinSvf, // superseded by TptSvf from v2 stage 6 on
         /* filterStageCount */        1,
+        /* dacClockTracksPitch */     0,                // same voice chip as S2000, fixed clock [I]
         /* interpolatorOrder */       1,                // zero-order hold, same voice chip as S2000 [I]
         /* supportsTimeStretch */     1,
         /* maxStretchPercent */       2000.0,
@@ -168,6 +173,7 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
         /* filterTracksPitch */       0,
         /* filterTopology */          AkzFilterTopology_ChamberlinSvf, // superseded by TptSvf from v2 stage 6 on
         /* filterStageCount */        2,                // the optional "2nd DIGITAL FILTER," both stages lowpass in series [M/I] -- replaces the old ">= 24.0 dB/oct" heuristic
+        /* dacClockTracksPitch */     0,                // same voice chip family, fixed clock [I]
         /* interpolatorOrder */       1,                // zero-order hold, same voice chip family [I]
         /* supportsTimeStretch */     1,
         /* maxStretchPercent */       2000.0,
@@ -195,57 +201,57 @@ constexpr AkzMachineProfile kProfiles[AkzMachine_Count] = {
 constexpr AkzStageProvenance kProvenance[AkzMachine_Count][AkzStage_Count] = {
     // AkzMachine_S900
     {
-        { AkzProvenanceLevel_Unmodelled, "Bandwidth control (fs = bandwidth * 2.5) not yet implemented in the DSP -- heritage-roster plan stage 4." },
+        { AkzProvenanceLevel_Inferred, "Bandwidth range fs = bandwidth * 2.5 is manual-cited, but the tracking anti-alias filter's cutoff ratio and pole count (aaFilterCutoffRatio/aaFilterPoles) are this project's inference from the shared bandwidth-tracking design, not a citation for the INPUT stage specifically." },
         { AkzProvenanceLevel_Manual, "12-bit SAR, 12-bit packed storage, no companding -- S900 manual." },
         { AkzProvenanceLevel_Inferred, "Cascaded one-pole stages approximate the analog SC Butterworth shape; not a precision Butterworth design -- see FilterModel.h." },
         { AkzProvenanceLevel_Inferred, "No digital interpolator to emulate -- per-voice DAC clock is varied directly, this project's inference from the analog architecture." },
         { AkzProvenanceLevel_Unmodelled, "S900 has no time-stretch capability at all -- added in the S950 -- Akai manual." },
-        { AkzProvenanceLevel_Unmodelled, "DAC back end (zero-order hold + reconstruction filter) not yet implemented -- heritage-roster plan stage 5." },
+        { AkzProvenanceLevel_Manual, "DAC clock varied directly with pitch (dacClockTracksPitch) -- same per-voice architecture citation as filterTracksPitch. The zero-order-hold/reconstruction modelling itself (RateModel::applyDacPath) is this project's implementation of that citation, not a separate manual quote." },
     },
     // AkzMachine_S950
     {
-        { AkzProvenanceLevel_Unmodelled, "Bandwidth control (fs = bandwidth * 2.5, confirmed 3 ways) not yet implemented in the DSP -- heritage-roster plan stage 4." },
+        { AkzProvenanceLevel_Inferred, "Bandwidth range fs = bandwidth * 2.5 confirmed 3 ways in the manual, but the tracking anti-alias filter's cutoff ratio/pole count are this project's inference -- see S900's identical note." },
         { AkzProvenanceLevel_Manual, "\"12-bit sampling / 16-bit processing,\" no companding -- S950 manual." },
         { AkzProvenanceLevel_Inferred, "Cascaded one-pole stages approximate the analog SC Butterworth shape; not a precision Butterworth design -- see FilterModel.h." },
         { AkzProvenanceLevel_Inferred, "No digital interpolator to emulate -- per-voice DAC clock varied directly, this project's inference." },
         { AkzProvenanceLevel_Manual, "CYCLIC-only time-stretch (Mon1/Pol2, no mode switch), \"Timestretch up to 999%\" -- S950 manual. INTELLIGENT's quality/width->sample-count curve is this project's own design, not a citation." },
-        { AkzProvenanceLevel_Unmodelled, "DAC back end (zero-order hold + reconstruction filter) not yet implemented -- heritage-roster plan stage 5." },
+        { AkzProvenanceLevel_Manual, "DAC clock varied directly with pitch -- same per-voice architecture citation as filterTracksPitch." },
     },
     // AkzMachine_S1000
     {
-        { AkzProvenanceLevel_Unmodelled, "Fixed-rate machine (22050/44100 Hz); no bandwidth stage to model, but the fixed-rate ADC/DAC front/back end itself isn't implemented yet -- heritage-roster plan stages 4/5." },
+        { AkzProvenanceLevel_Inferred, "Two fixed rates (22050/44100 Hz) are manual-cited; the anti-alias filter's cutoff ratio/pole count are an unflagged-by-the-manual generic placeholder, since decimation is rarely exercised on a dual-fixed-rate machine." },
         { AkzProvenanceLevel_Manual, "\"16-bit linear encoding,\" no companding -- S1000 manual." },
         { AkzProvenanceLevel_Inferred, "Cascade approximates the cited -18dB/oct slope; not a precision filter design -- see FilterModel.h." },
         { AkzProvenanceLevel_Inferred, "Interpolator order unstated by Akai (\"24-bit algorithm, custom VLSI\" is arithmetic precision, not filter order); linear assumed pending a by-ear revision -- README Known limitations." },
         { AkzProvenanceLevel_Manual, "CYCLIC/INTELLIGENT modes, zone select, \"25% to 2000%\" range -- S1000 manual, added OS 2.0." },
-        { AkzProvenanceLevel_Unmodelled, "DAC back end (zero-order hold + reconstruction filter) not yet implemented -- heritage-roster plan stage 5." },
+        { AkzProvenanceLevel_Manual, "\"Fixed passive LC reconstruction... not by pitch\" -- DAC clock does not track transpose, same citation as filterTracksPitch." },
     },
     // AkzMachine_S2000
     {
-        { AkzProvenanceLevel_Unmodelled, "Fixed-rate machine (22050/44100 Hz); ADC/DAC front/back end not yet implemented -- heritage-roster plan stages 4/5." },
+        { AkzProvenanceLevel_Inferred, "Two fixed rates (22050/44100 Hz) are manual-cited; the anti-alias filter's cutoff ratio/pole count are an unflagged-by-the-manual generic placeholder." },
         { AkzProvenanceLevel_Manual, "16-bit linear, no companding -- S2000 manual." },
         { AkzProvenanceLevel_Manual, "Resonant SVF, identical L7A1045 silicon to the S3000XL -- manual-confirmed, contra common belief the S2000 lacks resonance. Exact difference equation from the MAME l7a1045_l6028_dsp_a device, used as a behavioural reference and reimplemented, not copied." },
         { AkzProvenanceLevel_Manual, "Zero-order hold, MAME-confirmed (frac bits discarded when addressing memory in l7a1045_l6028_dsp_a.cpp)." },
         { AkzProvenanceLevel_Manual, "CYCLIC/INTELLIGENT modes, CYC LENGTH default 1340 -- S2000 manual. INTELLIGENT's quality/width curve is this project's own design, not a citation." },
-        { AkzProvenanceLevel_Unmodelled, "DAC back end (zero-order hold + reconstruction filter) not yet implemented -- heritage-roster plan stage 5." },
+        { AkzProvenanceLevel_Manual, "\"Runs at fixed 44.1kHz after pitch interpolation\" -- DAC clock does not track transpose, same MAME-derived citation as filterTracksPitch." },
     },
     // AkzMachine_S3000
     {
-        { AkzProvenanceLevel_Unmodelled, "Fixed-rate machine (22050/44100 Hz); ADC/DAC front/back end not yet implemented -- heritage-roster plan stages 4/5." },
+        { AkzProvenanceLevel_Inferred, "Two fixed rates (22050/44100 Hz) are manual-cited; the anti-alias filter's cutoff ratio/pole count are an unflagged-by-the-manual generic placeholder." },
         { AkzProvenanceLevel_Manual, "16-bit linear, no companding -- S3000 manual." },
         { AkzProvenanceLevel_Manual, "Same L7A1045 silicon as S2000 -- manual-confirmed resonant SVF." },
         { AkzProvenanceLevel_Manual, "Zero-order hold, same voice chip as S2000, MAME-confirmed." },
         { AkzProvenanceLevel_Manual, "CYCLIC/INTELLIGENT modes, zone select -- S3000 manual." },
-        { AkzProvenanceLevel_Unmodelled, "DAC back end (zero-order hold + reconstruction filter) not yet implemented -- heritage-roster plan stage 5." },
+        { AkzProvenanceLevel_Manual, "Same fixed-clock voice chip as S2000 -- DAC clock does not track transpose." },
     },
     // AkzMachine_S3200
     {
-        { AkzProvenanceLevel_Unmodelled, "Fixed-rate machine (22050/44100 Hz); ADC/DAC front/back end not yet implemented -- heritage-roster plan stages 4/5." },
+        { AkzProvenanceLevel_Inferred, "Two fixed rates (22050/44100 Hz) are manual-cited; the anti-alias filter's cutoff ratio/pole count are an unflagged-by-the-manual generic placeholder." },
         { AkzProvenanceLevel_Inferred, "18-bit converters on individual outs, but stored data remains 16-bit -- manual states the converter spec; how that interacts with storage is this project's reading." },
         { AkzProvenanceLevel_Inferred, "Primary L7A1045 filter manual-confirmed; the optional 2nd digital filter (L7A0986 DFL) giving 24dB/oct \"Moog-ish\" mode is a manual-cited feature whose exact combination this project infers." },
         { AkzProvenanceLevel_Manual, "Zero-order hold, same voice chip family, MAME-confirmed." },
         { AkzProvenanceLevel_Manual, "CYCLIC/INTELLIGENT modes, zone select -- S3200 manual." },
-        { AkzProvenanceLevel_Unmodelled, "DAC back end (zero-order hold + reconstruction filter) not yet implemented -- heritage-roster plan stage 5." },
+        { AkzProvenanceLevel_Manual, "Same fixed-clock voice chip family -- DAC clock does not track transpose." },
     },
 };
 

@@ -63,6 +63,19 @@ double resolveSampleRateHz(AkzMachine machine, float requestedSampleRateHz, doub
 // hostSampleRateHz (nothing to decimate).
 void applyRecordPath(float* buffer, size_t count, AkzMachine machine, double effectiveRateHz, double hostSampleRateHz);
 
+// Applies the DAC back end to `buffer` in place: zero-order-hold at
+// `playbackRateHz` (the caller resolves whether that's effectiveRateHz
+// itself, for a machine whose conversion clock is fixed, or
+// effectiveRateHz * transposeRatio, for one whose DAC clock tracks pitch
+// -- see AkzMachineProfile.dacClockTracksPitch). No anti-alias filter (a
+// D/A stage doesn't alias input content the way an A/D stage does) and
+// no re-quantisation (bit depth was already fixed at record time by
+// applyRecordPath -- re-quantising here would double-crush). A no-op
+// when playbackRateHz >= hostSampleRateHz. Length-neutral, same
+// discipline as applyRecordPath -- see StretchEngine.cpp for why this
+// must run before the pre-filter cache point, not after.
+void applyDacPath(float* buffer, size_t count, AkzMachine machine, double playbackRateHz, double hostSampleRateHz);
+
 } // namespace akz
 
 #endif // AKAIZER_RATE_MODEL_H

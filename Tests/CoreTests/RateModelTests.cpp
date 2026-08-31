@@ -158,6 +158,61 @@ AKZ_TEST(decimating_below_a_tones_frequency_produces_the_predicted_alias) {
     AKZ_CHECK(aliasCorr > originalCorr);
 }
 
+// -- applyDacPath (v2 heritage-roster plan, stage 5) ------------------------
+
+AKZ_TEST(dac_path_is_a_no_op_at_or_above_host_rate) {
+    auto source = makeSine(2000, 1000.0, 44100.0);
+    auto untouched = source;
+
+    applyDacPath(source.data(), source.size(), AkzMachine_S900, 44100.0, 44100.0);
+    for (size_t i = 0; i < source.size(); ++i) {
+        AKZ_CHECK_EQ(source[i], untouched[i]);
+    }
+}
+
+AKZ_TEST(dac_path_holds_each_sample_across_a_playback_clock_period) {
+    // Same staircase character as the record path's decimation, but
+    // driven by playbackRateHz (the caller's resolved DAC clock)
+    // instead of the record-time effective rate -- the two legitimately
+    // differ whenever transpose is in play on a pitch-tracking machine.
+    const double hostRate = 44100.0;
+    const double playbackRate = 12000.0;
+    auto source = makeSine(4000, 300.0, hostRate);
+
+    applyDacPath(source.data(), source.size(), AkzMachine_S900, playbackRate, hostRate);
+
+    const double samplesPerPlaybackSample = hostRate / playbackRate;
+    double nextBoundary = 0.0;
+    float blockValue = source[0];
+    for (size_t i = 0; i < source.size(); ++i) {
+        if (static_cast<double>(i) >= nextBoundary) {
+            blockValue = source[i];
+            nextBoundary += samplesPerPlaybackSample;
+        }
+        AKZ_CHECK_EQ(source[i], blockValue);
+    }
+}
+
+AKZ_TEST(dac_path_does_not_quantise_bit_depth_was_already_fixed_at_record_time) {
+    // Re-quantising here would double-crush a signal whose bit depth was
+    // already fixed by applyRecordPath -- feed a value that would NOT
+    // survive 12-bit quantisation unchanged, and confirm applyDacPath
+    // leaves it exactly as it found it (aside from the hold itself).
+    const double hostRate = 44100.0;
+    const double playbackRate = 20000.0;
+    std::vector<float> source(2000, 0.123456789f); // a value quantize() would visibly move at 12 bits
+    float beforeQuantize = source[0];
+    float afterQuantizeWouldBe = quantize(beforeQuantize, akz_machine_profile(AkzMachine_S900)->bitDepth);
+    AKZ_CHECK(std::abs(beforeQuantize - afterQuantizeWouldBe) > 1e-6); // sanity: quantising this value really would change it
+
+    applyDacPath(source.data(), source.size(), AkzMachine_S900, playbackRate, hostRate);
+    // Held blocks all derive from the constant input value, so every
+    // sample must still be exactly the original, un-quantised value.
+    for (float sample : source) {
+        AKZ_CHECK_NEAR(sample, beforeQuantize, 1e-9);
+    }
+}
+
 AKZ_TEST(record_path_never_changes_buffer_length_only_content) {
     // Length-neutrality is the one hard invariant every caller depends
     // on (StretchEngine::outputLength()'s mirrored arithmetic, the

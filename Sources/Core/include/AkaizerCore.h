@@ -130,6 +130,21 @@ typedef struct AkzMachineProfile {
     AkzFilterTopology filterTopology; // which class FilterModel.cpp's factory instantiates
     int    filterStageCount;          // stages of filterTopology run in series (2 for S3200's "2nd DIGITAL FILTER" -> 24dB/oct, 1 otherwise)
 
+    // DAC back end (v2 heritage-roster plan, stage 5 -- RateModel.cpp's
+    // applyDacPath). 1 when the machine's D/A conversion clock is the
+    // SAME clock that sets pitch (S900/S950 -- "per-voice DAC clock is
+    // varied directly," the same physical fact filterTracksPitch already
+    // captures for these two); 0 when conversion runs at a fixed
+    // native-rate clock regardless of transpose (S1000's "fixed passive
+    // LC reconstruction... not by pitch," S2000/S3000/S3200's "runs at
+    // fixed 44.1kHz after pitch interpolation on the real chip" -- see
+    // FilterModel.h). A separate field from filterTracksPitch on
+    // purpose, not just a rename of it: the two happen to agree for
+    // every machine here (one physical clock, two consequences), but a
+    // future machine could plausibly have its VCF and its DAC clock
+    // behave differently.
+    int    dacClockTracksPitch;
+
     // Transposition / interpolation. See MachineProfile.cpp for citations.
     int    interpolatorOrder;         // 0 = none (S900/S950 vary the DAC clock directly), 1 = zero-order hold, 2 = linear
 

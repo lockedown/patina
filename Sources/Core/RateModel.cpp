@@ -47,6 +47,31 @@ private:
     std::vector<double> _state;
 };
 
+// Shared by applyRecordPath's decimation step and applyDacPath: true
+// decimation to targetRateHz followed by zero-order-hold reconstruction
+// back to hostSampleRateHz, computed as one combined pass rather than
+// through an intermediate shorter buffer -- see RateModel.h. Reads from
+// a filtered copy while writing the held result back into `buffer` in
+// place, since reading and writing the same array at different rates in
+// a single forward pass would otherwise let already-overwritten
+// "future" samples leak into the read side. Caller guarantees
+// targetRateHz < hostSampleRateHz (the no-decimation-needed case is each
+// caller's own early return, since what happens instead -- quantise
+// only, vs. nothing at all -- differs between them).
+void holdAtRate(float* buffer, size_t count, double targetRateHz, double hostSampleRateHz) {
+    const std::vector<float> source(buffer, buffer + count);
+    const double samplesPerTargetSample = hostSampleRateHz / targetRateHz;
+    double nextBoundary = 0.0;
+    float held = source[0];
+    for (size_t i = 0; i < count; ++i) {
+        if (static_cast<double>(i) >= nextBoundary) {
+            held = source[i];
+            nextBoundary += samplesPerTargetSample;
+        }
+        buffer[i] = held;
+    }
+}
+
 } // namespace
 
 double resolveSampleRateHz(AkzMachine machine, float requestedSampleRateHz, double hostSampleRateHz) {
@@ -85,26 +110,9 @@ void applyRecordPath(float* buffer, size_t count, AkzMachine machine, double eff
     }
 
     // True decimation to effectiveRateHz followed by zero-order-hold
-    // reconstruction back to hostSampleRateHz nets out to "sample-and-
-    // hold at the machine's rate, expressed directly at host rate" --
-    // mathematically the same result as shrinking then growing through
-    // an intermediate buffer, computed here without one, which is what
-    // makes this length-neutral by construction. Read from a filtered
-    // copy while writing the held result back into `buffer` in place --
-    // reading and writing the same array at different rates in a single
-    // forward pass would otherwise let already-overwritten "future"
-    // samples leak into the read side.
-    const std::vector<float> filtered(buffer, buffer + count);
-    const double samplesPerMachineSample = hostSampleRateHz / effectiveRateHz;
-    double nextBoundary = 0.0;
-    float held = filtered[0];
-    for (size_t i = 0; i < count; ++i) {
-        if (static_cast<double>(i) >= nextBoundary) {
-            held = filtered[i];
-            nextBoundary += samplesPerMachineSample;
-        }
-        buffer[i] = held;
-    }
+    // reconstruction back to hostSampleRateHz -- see holdAtRate's own
+    // comment for why this is length-neutral by construction.
+    holdAtRate(buffer, count, effectiveRateHz, hostSampleRateHz);
 
     // Bit-depth quantise the now rate-limited signal last -- sample rate
     // and bit depth are independent ADC properties; either order is
@@ -112,6 +120,15 @@ void applyRecordPath(float* buffer, size_t count, AkzMachine machine, double eff
     // contained rather than splitting it around the caller's own
     // quantizeBuffer call the way v1 had it.
     quantizeBuffer(buffer, count, profile.bitDepth);
+}
+
+void applyDacPath(float* buffer, size_t count, AkzMachine machine, double playbackRateHz, double hostSampleRateHz) {
+    if (count == 0) return;
+    if (playbackRateHz <= 0.0 || playbackRateHz >= hostSampleRateHz) {
+        return; // nothing to hold beyond native resolution -- see RateModel.h
+    }
+    (void)machine; // not yet needed -- every machine uses the same ZOH reconstruction shape; kept for a future per-topology DAC character
+    holdAtRate(buffer, count, playbackRateHz, hostSampleRateHz);
 }
 
 } // namespace akz

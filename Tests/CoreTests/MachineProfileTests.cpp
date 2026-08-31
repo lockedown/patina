@@ -135,15 +135,19 @@ AKZ_TEST(every_machine_and_stage_has_a_provenance_note) {
     }
 }
 
-AKZ_TEST(rate_and_dac_stages_are_unmodelled_until_their_plan_stages_land) {
-    // Rate/Dac provenance must say Unmodelled for every machine today --
-    // heritage-roster plan stages 4/5 are what changes this, machine by
-    // machine, as the DSP actually gains the capability.
+AKZ_TEST(rate_and_dac_stages_are_no_longer_unmodelled_now_that_stages_4_and_5_landed) {
+    // Superseded version of a stage-2 test that (correctly, at the time)
+    // asserted Unmodelled for every machine. Heritage-roster plan stages
+    // 4 (RateModel::applyRecordPath) and 5 (applyDacPath) now implement
+    // both stages for all six Akai machines, so Unmodelled would be
+    // FALSE here -- this is the "test suite mirrors reality" convention
+    // (MachineProfile.cpp's kProvenance header comment) applied to
+    // itself, not a relaxation.
     for (int m = 0; m < AkzMachine_Count; ++m) {
         const AkzStageProvenance* rate = akz_machine_stage_provenance(static_cast<AkzMachine>(m), AkzStage_Rate);
         const AkzStageProvenance* dac = akz_machine_stage_provenance(static_cast<AkzMachine>(m), AkzStage_Dac);
-        AKZ_CHECK(rate->level == AkzProvenanceLevel_Unmodelled);
-        AKZ_CHECK(dac->level == AkzProvenanceLevel_Unmodelled);
+        AKZ_CHECK(rate->level != AkzProvenanceLevel_Unmodelled);
+        AKZ_CHECK(dac->level != AkzProvenanceLevel_Unmodelled);
     }
 }
 
