@@ -677,7 +677,14 @@ struct ContentView: View {
                         // thing standing between this and a crash, don't
                         // offer stretch knobs for a machine that
                         // structurally doesn't have the feature.
-                        Text("\(machineProfile.displayName) has no time-stretch capability (added in the S950).")
+                        // "(added in the S950)" only makes sense for
+                        // S900 -- the four heritage-roster machines
+                        // (v2 stage 10) never had time-stretch at all,
+                        // so the notice is machine-specific rather than
+                        // always naming the S950.
+                        Text(selectedMachine == AkzMachine_S900
+                            ? "\(machineProfile.displayName) has no time-stretch capability (added in the S950)."
+                            : "\(machineProfile.displayName) has no time-stretch capability -- Preview/Process still apply its converter, filter and varispeed character.")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                     }
@@ -702,7 +709,24 @@ struct ContentView: View {
                             )
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(loadedSample == nil || !_stretchIsSupported)
+                        // No `|| !_stretchIsSupported` here (v2
+                        // heritage-roster plan, stage 11 fix): every
+                        // machine has SOME audio-affecting parameters
+                        // (Transpose, Cutoff, and now Bandwidth are all
+                        // unconditional -- MachineControls.swift), not
+                        // just the ones that time-stretch. Disabling
+                        // Preview/Process for a no-stretch machine
+                        // predates v2 (it also silently blocked S900),
+                        // but four of the ten machines here have NO
+                        // time-stretch at all -- leaving it in would
+                        // have meant SP-1200/Fairlight/Mirage/Emulator
+                        // II could show knobs a user could never
+                        // actually hear or export. StretchEngine.cpp's
+                        // own supportsTimeStretch gate (stage 3) already
+                        // forces ratio 1.0 for these machines regardless
+                        // of what the UI sends, so processing one is
+                        // always safe.
+                        .disabled(loadedSample == nil)
                         .help("Hear the fully processed result live while you turn the knobs. Nothing is written until you press Process.")
 
                         if isLiveAuditionOn && isRecomputingVisible {
@@ -723,7 +747,7 @@ struct ContentView: View {
 
                     HStack {
                         Button("Process", action: process)
-                            .disabled(loadedSample == nil || !_stretchIsSupported)
+                            .disabled(loadedSample == nil) // see the Preview button's comment above -- every machine has something to process, not just stretch-capable ones
                         Button("Revert", action: _revertToOriginal)
                             .disabled(loadedSample == nil || (_snapshot() == .defaults(for: selectedMachine) && processedChannels == nil))
                             .help("Reset all parameters to \(machineProfile.displayName) defaults and discard the processed render. Does not modify the file on disk.")
@@ -747,6 +771,20 @@ struct ContentView: View {
                             .keyboardShortcut(".", modifiers: .command)
                         Button(_renderIsStale ? "Save Processed… (stale)" : "Save Processed…", action: saveProcessed)
                             .disabled(processedChannels == nil)
+                        // v2 heritage-roster plan, stage 11: closes the
+                        // README's "no 'save what I'm hearing right
+                        // now' path" gap. Save Processed above saves the
+                        // last offline Process() result, which can
+                        // differ from live audition's current sound if
+                        // a knob moved since the last Process press --
+                        // this renders fresh from the CURRENT params
+                        // (the same ones live audition is already
+                        // playing, via _currentParams()) without
+                        // stopping audition, so what gets saved is
+                        // provably what's audible right now.
+                        Button("Save Preview…", action: _saveWhatImHearing)
+                            .disabled(loadedSample == nil || !isLiveAuditionOn)
+                            .help("Render and save exactly what live audition is currently playing, without stopping it.")
                         Button("Save Preset…", action: _promptSavePreset)
                             .disabled(loadedSample == nil)
                     }
@@ -1116,11 +1154,16 @@ struct ContentView: View {
         if StretchProcessor.profile(for: machine).hasModeSwitch == 0 {
             selectedMode = AkzStretchMode_Cyclic
         }
-        if StretchProcessor.profile(for: machine).supportsTimeStretch == 0 {
-            isLiveAuditionOn = false // triggers its own onChange -> _stopLiveAudition()
-        } else {
-            _pushLiveParamsIfNeeded()
-        }
+        // Live audition stays running across a machine switch (v2
+        // heritage-roster plan, stage 11 fix) -- it used to force-stop
+        // for any non-stretch machine, under the same flawed assumption
+        // the Preview/Process buttons' old `!_stretchIsSupported` guard
+        // made: that a machine with no time-stretch has nothing worth
+        // previewing. Filter, transpose and (now) bandwidth all still
+        // apply and are all audible live; StretchEngine.cpp's own
+        // supportsTimeStretch gate makes sending it stretch params on
+        // such a machine harmless regardless.
+        _pushLiveParamsIfNeeded()
     }
 
     /// Assigns all eleven params from a snapshot in one shot -- undo
@@ -1331,6 +1374,32 @@ struct ContentView: View {
             let processedSample = LoadedSample(url: url, format: sample.format, rawData: rawData)
             try audioFileService.save(processedSample, to: url)
             statusMessage = "Saved processed audio to \(url.lastPathComponent)."
+        }
+    }
+
+    /// v2 heritage-roster plan, stage 11. Renders fresh from
+    /// _currentParams() -- the exact same params live audition is
+    /// already playing, by construction (both paths have always read
+    /// from this one function; see its own doc comment) -- so what
+    /// this saves is provably what's audible right now, not the last
+    /// offline Process() result Save Processed uses. Live audition
+    /// itself is never touched: rendering happens on a detached Task,
+    /// same pattern as ProcessedWavExport's drag-out export, and the
+    /// result is adopted as the new processedChannels (so Play
+    /// Processed/Save Processed/the waveform overlay all pick it up
+    /// too) before reusing saveProcessed()'s own save-panel flow.
+    private func _saveWhatImHearing() {
+        guard let sample = loadedSample else { return }
+        let snapshot = _snapshot()
+        let params = snapshot.params
+        Task {
+            let channels = await Task.detached(priority: .userInitiated) {
+                ProcessedRender.render(sample: sample, params: params)
+            }.value
+            processedChannels = channels
+            processedWaveformSamples = channels.first
+            renderedSnapshot = snapshot
+            saveProcessed()
         }
     }
 
