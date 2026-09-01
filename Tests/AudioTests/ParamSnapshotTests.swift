@@ -84,4 +84,80 @@ final class ParamSnapshotTests: XCTestCase {
         let preset = AkaizerPreset(name: "Test", params: _sampleSnapshot().params)
         XCTAssertEqual(preset.snapshot, ParamSnapshot(params: preset.params))
     }
+
+    /// 2.1 feedback: "Cutoff use during preview creates clicks and lag on
+    /// longer samples." The realtime worker's cheap filter-only path
+    /// (RealtimeStretchPlayer's paramsDifferOnlyInFilter, a memcmp of the
+    /// whole AkzStretchParams with the two filter fields zeroed) only
+    /// fires when NO other field moved. If .params ever produced a
+    /// different bit pattern for an unrelated field just because cutoff
+    /// changed -- e.g. Double->Float rounding noise -- every cutoff tick
+    /// would silently fall through to a full re-render (which resets the
+    /// realtime read position to 0: the "jump to the start" + click the
+    /// user is seeing). Pins that a cutoff-only edit really does produce
+    /// params differing in filterCutoff01 alone.
+    func testChangingOnlyCutoffChangesOnlyFilterCutoffInParams() {
+        let base = _sampleSnapshot()
+        var moved = base
+        moved.filterCutoff = 0.4321
+
+        let baseParams = base.params
+        let movedParams = moved.params
+
+        XCTAssertEqual(movedParams.machine, baseParams.machine)
+        XCTAssertEqual(movedParams.engine, baseParams.engine)
+        XCTAssertEqual(movedParams.mode, baseParams.mode)
+        XCTAssertEqual(movedParams.timeFactorPercent, baseParams.timeFactorPercent)
+        XCTAssertEqual(movedParams.cycleLengthSamples, baseParams.cycleLengthSamples)
+        XCTAssertEqual(movedParams.quality, baseParams.quality)
+        XCTAssertEqual(movedParams.width, baseParams.width)
+        XCTAssertEqual(movedParams.transposeSemitones, baseParams.transposeSemitones)
+        XCTAssertEqual(movedParams.filterResonance01, baseParams.filterResonance01)
+        XCTAssertEqual(movedParams.sampleRateHz, baseParams.sampleRateHz)
+        XCTAssertNotEqual(movedParams.filterCutoff01, baseParams.filterCutoff01)
+    }
+
+    /// Same guard, for resonance -- the cheap path's other legal field.
+    func testChangingOnlyResonanceChangesOnlyFilterResonanceInParams() {
+        let base = _sampleSnapshot()
+        var moved = base
+        moved.filterResonance = 0.1234
+
+        let baseParams = base.params
+        let movedParams = moved.params
+
+        XCTAssertEqual(movedParams.machine, baseParams.machine)
+        XCTAssertEqual(movedParams.engine, baseParams.engine)
+        XCTAssertEqual(movedParams.mode, baseParams.mode)
+        XCTAssertEqual(movedParams.timeFactorPercent, baseParams.timeFactorPercent)
+        XCTAssertEqual(movedParams.cycleLengthSamples, baseParams.cycleLengthSamples)
+        XCTAssertEqual(movedParams.quality, baseParams.quality)
+        XCTAssertEqual(movedParams.width, baseParams.width)
+        XCTAssertEqual(movedParams.transposeSemitones, baseParams.transposeSemitones)
+        XCTAssertEqual(movedParams.filterCutoff01, baseParams.filterCutoff01)
+        XCTAssertEqual(movedParams.sampleRateHz, baseParams.sampleRateHz)
+        XCTAssertNotEqual(movedParams.filterResonance01, baseParams.filterResonance01)
+    }
+
+    /// The cheap path also depends on repeated reads of an UNCHANGED
+    /// snapshot producing bit-identical params -- ContentView rebuilds
+    /// `.params` fresh from @State on every push (_pushLiveParamsIfNeeded),
+    /// so if the same Double values ever rounded to different Float bits
+    /// across calls, an untouched param would look like it moved.
+    func testUnchangedSnapshotProducesBitIdenticalParamsAcrossRepeatedReads() {
+        let snapshot = _sampleSnapshot()
+        let first = snapshot.params
+        let second = snapshot.params
+        XCTAssertTrue(memcmp0(first, second))
+    }
+}
+
+/// Byte-for-byte comparison, mirroring the C++ side's memcmp -- XCTAssertEqual
+/// on the imported struct would use its own (absent) Equatable, not this.
+private func memcmp0(_ a: AkzStretchParams, _ b: AkzStretchParams) -> Bool {
+    withUnsafeBytes(of: a) { aBytes in
+        withUnsafeBytes(of: b) { bBytes in
+            aBytes.elementsEqual(bBytes)
+        }
+    }
 }

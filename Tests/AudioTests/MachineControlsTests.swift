@@ -90,6 +90,26 @@ final class MachineControlsTests: XCTestCase {
         XCTAssertEqual(bandwidth?.range.upperBound, profile.maxSampleRateHz)
     }
 
+    /// 2.1: roster-wide guard closing the loop between the knob and the
+    /// default it starts at -- every variable-rate machine's bandwidth
+    /// range must sit strictly above 0 (no bypass position on the dial),
+    /// and ParamSnapshot.defaults(for:)'s sampleRateHz must land inside
+    /// that same range, not just be non-zero in the abstract.
+    func testEveryBandwidthRangeIsAboveZeroAndContainsItsOwnDefault() {
+        for machine in StretchProcessor.allMachines {
+            let profile = StretchProcessor.profile(for: machine)
+            guard profile.hasVariableSampleRate != 0 else { continue }
+            let bandwidth = MachineControls.controls(for: machine, mode: AkzStretchMode_Cyclic)
+                .first { $0.id == .bandwidth }
+            XCTAssertNotNil(bandwidth, "\(machine) has hasVariableSampleRate but no bandwidth control")
+            XCTAssertGreaterThan(bandwidth?.range.lowerBound ?? 0, 0, "\(machine)'s bandwidth range includes 0")
+
+            let defaultRate = ParamSnapshot.defaults(for: machine).sampleRateHz
+            XCTAssertGreaterThanOrEqual(defaultRate, bandwidth?.range.lowerBound ?? .infinity, "\(machine)'s default rate is below its own knob range")
+            XCTAssertLessThanOrEqual(defaultRate, bandwidth?.range.upperBound ?? -.infinity, "\(machine)'s default rate is above its own knob range")
+        }
+    }
+
     /// Guards the removal of the old `max(25.0, ...)` UI-side clamp: if
     /// a future machine profile sets supportsTimeStretch != 0 with a
     /// maxStretchPercent that doesn't leave a valid 25...N range, this

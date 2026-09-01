@@ -192,6 +192,83 @@ AKZ_TEST(realtime_player_filter_only_change_does_not_reset_read_position) {
     akz_realtime_player_destroy(player);
 }
 
+AKZ_TEST(realtime_player_filter_only_change_crossfades_instead_of_stepping) {
+    // 2.1 feedback: "Cutoff use during preview creates clicks... on
+    // longer samples." The cheap filter-only path used to swap _published
+    // straight to the freshly refiltered buffer mid-stream -- a hard
+    // sample discontinuity at the swap. This pins the fix: the very next
+    // pull() after the change starts 100% on the OLD (pre-change) buffer
+    // and reaches 100% the NEW buffer only after the crossfade window
+    // (5ms @ 44100Hz == 220 frames) has fully elapsed, with nothing in
+    // between abruptly jumping straight from one to the other.
+    auto source = makeRamp(4000);
+    AkzStretchParams params;
+    akz_stretch_params_default(AkzMachine_S1000, &params);
+    params.engine = AkzEngine_Classic;
+    params.mode = AkzStretchMode_Cyclic;
+    params.timeFactorPercent = 100.0f;
+    params.cycleLengthSamples = 200; // divides 4000 evenly -> output length == source length
+    params.filterCutoff01 = 1.0f; // near-identity to start
+
+    // Reference for the OLD (pre-change) buffer, via the already-proven
+    // full-recompute path -- reapplyFilterOnly and a fresh recompute both
+    // just run applyFilter over the same cached pre-filter buffer, so
+    // this is bit-identical to what the worker actually published.
+    AkzStretchEngine* oldOffline = akz_stretch_engine_create(44100.0);
+    akz_stretch_engine_set_params(oldOffline, &params);
+    akz_stretch_engine_set_source(oldOffline, source.data(), source.size());
+    size_t oldLen = akz_stretch_engine_output_length(oldOffline);
+    std::vector<float> oldReference(oldLen);
+    akz_stretch_engine_process(oldOffline, oldReference.data(), oldLen);
+    akz_stretch_engine_destroy(oldOffline);
+
+    AkzRealtimePlayer* player = akz_realtime_player_create(44100.0);
+    akz_realtime_player_set_source(player, source.data(), source.size());
+    akz_realtime_player_set_params(player, &params);
+    waitUntilReady(player);
+
+    // Advance to a fixed, known read position (1000), well clear of both
+    // the start and the wraparound point 3000 frames later.
+    float discard[1000];
+    akz_realtime_player_pull(player, discard, 1000);
+
+    // Filter-only change: heavy low-pass, so old vs. new clearly differ.
+    params.filterCutoff01 = 0.05f;
+    akz_realtime_player_set_params(player, &params);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    AkzStretchEngine* newOffline = akz_stretch_engine_create(44100.0);
+    akz_stretch_engine_set_params(newOffline, &params);
+    akz_stretch_engine_set_source(newOffline, source.data(), source.size());
+    size_t newLen = akz_stretch_engine_output_length(newOffline);
+    std::vector<float> newReference(newLen);
+    akz_stretch_engine_process(newOffline, newReference.data(), newLen);
+    akz_stretch_engine_destroy(newOffline);
+
+    // Sanity: the two references really do differ at the position under
+    // test, or this whole test would trivially pass either way.
+    AKZ_CHECK(oldReference[1000] != newReference[1000]);
+
+    // Pull exactly one crossfade window's worth, starting at the swap.
+    std::vector<float> pulled(220);
+    akz_realtime_player_pull(player, pulled.data(), pulled.size());
+
+    // First sample of the crossfade: 100% old, none of the new buffer yet.
+    AKZ_CHECK_EQ(pulled[0], oldReference[1000]);
+
+    // Somewhere in the middle, neither pure old nor pure new -- a real
+    // blend, not a step function in disguise.
+    bool middleDiffersFromBothEndpoints = pulled[110] != oldReference[1000 + 110] && pulled[110] != newReference[1000 + 110];
+    AKZ_CHECK(middleDiffersFromBothEndpoints);
+
+    // One more pull, past the end of the window: fully on the new buffer.
+    float afterWindow[1];
+    akz_realtime_player_pull(player, afterWindow, 1);
+    AKZ_CHECK_EQ(afterWindow[0], newReference[1000 + 220]);
+
+    akz_realtime_player_destroy(player);
+}
+
 AKZ_TEST(realtime_player_stretch_affecting_change_publishes_pending_then_resets_on_commit) {
     // Companion to the filter-only test above: a change that DOES need a
     // full re-render (here, cycleLengthSamples -- stretch-affecting, not
@@ -371,6 +448,124 @@ AKZ_TEST(two_independent_players_commit_gated_together_stay_in_sync) {
 
     akz_realtime_player_destroy(left);
     akz_realtime_player_destroy(right);
+}
+
+AKZ_TEST(realtime_player_splice_guide_matches_offline_engine_given_the_same_guide) {
+    // 2.1 stereo splice linkage, realtime path: akz_realtime_player_set_
+    // splice_guide is the same mechanism as
+    // akz_stretch_engine_set_splice_guide, threaded through to the
+    // background worker -- this pins that the realtime player's
+    // background recompute actually consults it, not just that the
+    // offline engine does (IntelligentModeTests.cpp covers that side).
+    auto source = makeRamp(20000);
+    AkzStretchParams params;
+    akz_stretch_params_default(AkzMachine_S1000, &params);
+    params.mode = AkzStretchMode_Intelligent;
+    params.timeFactorPercent = 150.0f;
+    params.quality = 60;
+    params.width = 50;
+
+    // A guide that's trivially distinguishable from an independent
+    // search's own choices (see IntelligentModeTests.cpp's
+    // clearing_the_guide_reverts_to_independent_search for the same
+    // reasoning) -- every offset forced to 0.
+    std::vector<long long> guide(64, 0);
+
+    // Reference: the offline engine given the identical guide.
+    AkzStretchEngine* offline = akz_stretch_engine_create(44100.0);
+    akz_stretch_engine_set_splice_guide(offline, guide.data(), guide.size());
+    akz_stretch_engine_set_params(offline, &params);
+    akz_stretch_engine_set_source(offline, source.data(), source.size());
+    size_t refLen = akz_stretch_engine_output_length(offline);
+    std::vector<float> reference(refLen);
+    akz_stretch_engine_process(offline, reference.data(), refLen);
+    akz_stretch_engine_destroy(offline);
+
+    AkzRealtimePlayer* player = akz_realtime_player_create(44100.0);
+    akz_realtime_player_set_splice_guide(player, guide.data(), guide.size());
+    akz_realtime_player_set_source(player, source.data(), source.size());
+    akz_realtime_player_set_params(player, &params);
+    waitUntilReady(player);
+    AKZ_CHECK(akz_realtime_player_is_ready(player));
+
+    std::vector<float> pulled(refLen);
+    akz_realtime_player_pull(player, pulled.data(), refLen);
+
+    bool identical = true;
+    for (size_t i = 0; i < refLen; ++i) {
+        if (pulled[i] != reference[i]) { identical = false; break; }
+    }
+    AKZ_CHECK(identical);
+
+    akz_realtime_player_destroy(player);
+}
+
+AKZ_TEST(realtime_player_splice_guide_change_alone_forces_a_full_recompute) {
+    // A guide-only change (nothing else in params/source moved) must NOT
+    // take the cheap filter-only path -- that path never touches
+    // synthesis at all, so taking it would silently ignore the new
+    // guide. Proven the same way the existing filter-only test proves
+    // the OPPOSITE case: a stretch-affecting change publishes to the
+    // PENDING slot (hasPendingCommit), not straight to _published.
+    auto source = makeRamp(20000);
+    AkzStretchParams params;
+    akz_stretch_params_default(AkzMachine_S1000, &params);
+    params.mode = AkzStretchMode_Intelligent;
+    params.timeFactorPercent = 150.0f;
+    params.quality = 60;
+    params.width = 50;
+
+    AkzRealtimePlayer* player = akz_realtime_player_create(44100.0);
+    akz_realtime_player_set_source(player, source.data(), source.size());
+    akz_realtime_player_set_params(player, &params);
+    waitUntilReady(player);
+    AKZ_CHECK(akz_realtime_player_is_ready(player));
+    AKZ_CHECK(!akz_realtime_player_has_pending_commit(player)); // consumed by waitUntilReady's own commits
+
+    std::vector<long long> guide(64, 0);
+    akz_realtime_player_set_splice_guide(player, guide.data(), guide.size());
+    waitForPendingCommit(player);
+    AKZ_CHECK(akz_realtime_player_has_pending_commit(player));
+
+    akz_realtime_player_destroy(player);
+}
+
+AKZ_TEST(realtime_player_read_position01_tracks_playback_and_resets_on_commit) {
+    // 2.1 feedback ("show playback bar over sample waveform"):
+    // read_position01 is what a playhead polls.
+    auto source = makeRamp(2000);
+    AkzStretchParams params;
+    akz_stretch_params_default(AkzMachine_S1000, &params);
+    params.engine = AkzEngine_Classic;
+    params.mode = AkzStretchMode_Cyclic;
+    params.timeFactorPercent = 100.0f;
+    params.cycleLengthSamples = 200; // -> output length 2000, divides evenly
+
+    AkzRealtimePlayer* player = akz_realtime_player_create(44100.0);
+    AKZ_CHECK_NEAR(akz_realtime_player_read_position01(player), 0.0, 1e-9); // before any publish
+
+    akz_realtime_player_set_source(player, source.data(), source.size());
+    akz_realtime_player_set_params(player, &params);
+    waitUntilReady(player);
+    AKZ_CHECK_NEAR(akz_realtime_player_read_position01(player), 0.0, 1e-9); // fresh publish, position 0
+
+    float discard[500];
+    akz_realtime_player_pull(player, discard, 500);
+    // 500 of 2000 -> 0.25, same position the filter-only test already
+    // relies on landing exactly here.
+    AKZ_CHECK_NEAR(akz_realtime_player_read_position01(player), 0.25, 1e-9);
+
+    // A stretch-affecting change resets to 0 on commit, not immediately
+    // (see the pending-commit test above) -- pin that read_position01
+    // agrees with that same two-step contract.
+    params.cycleLengthSamples = 300;
+    akz_realtime_player_set_params(player, &params);
+    waitForPendingCommit(player);
+    AKZ_CHECK_NEAR(akz_realtime_player_read_position01(player), 0.25, 1e-9); // still the OLD published buffer
+    akz_realtime_player_commit_pending(player);
+    AKZ_CHECK_NEAR(akz_realtime_player_read_position01(player), 0.0, 1e-9); // reset on commit
+
+    akz_realtime_player_destroy(player);
 }
 
 AKZ_TEST(realtime_player_is_recomputing_toggles_true_then_false_across_a_render) {

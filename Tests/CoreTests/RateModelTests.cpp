@@ -43,14 +43,41 @@ double autocorrelationAtLag(const std::vector<float>& signal, size_t lag) {
 
 } // namespace
 
-AKZ_TEST(zero_sample_rate_resolves_to_host_rate_not_machine_default) {
-    // The documented sentinel: every existing preset/default decodes
-    // sampleRateHz as exactly 0 (see PresetStore.swift), and this must
-    // mean "no rate stage," not "the machine's own native rate" -- the
-    // latter would silently change S900/S950's default sound the moment
-    // this stage shipped, with no UI control yet to undo it.
-    AKZ_CHECK_NEAR(resolveSampleRateHz(AkzMachine_S950, 0.0f, 44100.0), 44100.0, 0.001);
-    AKZ_CHECK_NEAR(resolveSampleRateHz(AkzMachine_S950, -5.0f, 48000.0), 48000.0, 0.001);
+AKZ_TEST(zero_sample_rate_resolves_to_machine_max_not_host_rate) {
+    // 2.1 feedback: "never be 0 or bypassed as this is the essence of the
+    // old sampler sound." Before this, <= 0 resolved to hostSampleRateHz
+    // -- a true bypass -- and every preset/default decoded sampleRateHz
+    // as exactly 0, so every machine shipped bypassed. Now 0 resolves to
+    // the machine's own top-end rate (AkaizerCore.h's documented
+    // contract for the field), so there is no value left that means
+    // "skip the rate stage entirely."
+    const AkzMachineProfile* s950 = akz_machine_profile(AkzMachine_S950);
+    const AkzMachineProfile* s900 = akz_machine_profile(AkzMachine_S900);
+    AKZ_CHECK_NEAR(resolveSampleRateHz(AkzMachine_S950, 0.0f, 44100.0), s950->maxSampleRateHz, 0.001);
+    AKZ_CHECK_NEAR(resolveSampleRateHz(AkzMachine_S900, -5.0f, 44100.0), s900->maxSampleRateHz, 0.001);
+}
+
+AKZ_TEST(record_path_at_a_variable_machines_own_default_rate_is_not_a_no_op) {
+    // Direct regression for the actual complaint, not just the resolver:
+    // S900's own default (its maxSampleRateHz, 40000, resolved from the 0
+    // sentinel above) is BELOW a 44.1kHz host, so running the record path
+    // at that rate must genuinely decimate+anti-alias, not pass through
+    // untouched the way record_path_at_host_rate_is_pure_quantisation_
+    // no_incidental_filtering pins for the >= host-rate case.
+    const double hostRate = 44100.0;
+    const AkzMachineProfile* s900 = akz_machine_profile(AkzMachine_S900);
+    auto source = makeSine(2000, 300.0, hostRate);
+    auto viaRecordPath = source;
+    auto viaQuantizeOnly = source;
+
+    applyRecordPath(viaRecordPath.data(), viaRecordPath.size(), AkzMachine_S900, s900->maxSampleRateHz, hostRate);
+    quantizeBuffer(viaQuantizeOnly.data(), viaQuantizeOnly.size(), s900->bitDepth);
+
+    bool differsFromQuantiseOnly = false;
+    for (size_t i = 0; i < source.size(); ++i) {
+        if (std::abs(viaRecordPath[i] - viaQuantizeOnly[i]) > 1e-6) { differsFromQuantiseOnly = true; break; }
+    }
+    AKZ_CHECK(differsFromQuantiseOnly);
 }
 
 AKZ_TEST(positive_sample_rate_clamps_into_machine_range) {

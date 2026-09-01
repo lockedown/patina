@@ -5,9 +5,10 @@
 // chain of `if`s. Lives in AkaizerAudio (not the App target) specifically
 // so it's unit-testable -- ContentView.swift has zero tests today, and
 // this is exactly the logic worth having them for: SP-1200 (no
-// time-stretch, has a bandwidth control) must show Bandwidth + Cutoff +
-// Transpose and NOTHING stretch-related; S950 (time-stretch AND
-// bandwidth) must show both clusters together. Getting that combination
+// time-stretch, no bandwidth control -- one fixed rate is its whole
+// character) must show only Cutoff + Transpose, nothing stretch- or
+// bandwidth-related; S950 (time-stretch AND bandwidth) must show both
+// clusters together. Getting that combination
 // right by hand, per machine, is exactly the kind of thing a descriptor
 // table generated from profile capability flags gets right by
 // construction instead.

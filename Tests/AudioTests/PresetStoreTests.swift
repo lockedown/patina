@@ -90,8 +90,10 @@ final class PresetStoreTests: XCTestCase {
     /// present, but no sampleRateHz key at all) must still decode --
     /// this is what proves the field really is additive, not a v3 in
     /// disguise. Distinct from the v1 fixture above, which also lacks
-    /// machineId.
-    func testPreSampleRateHzV2FileDecodesWithMachineDefaultRate() throws {
+    /// machineId. 2.1: the migrated value must be the NAMED machine's
+    /// (akai.s2000) own top-end rate, never 0/bypass -- see PresetStore's
+    /// init(from:) migration.
+    func testPreSampleRateHzV2FileDecodesWithMachineMaxRate() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let store = PresetStore(baseDirectory: dir)
         let fileURL = dir.appendingPathComponent("Patina", isDirectory: true).appendingPathComponent("presets.json")
@@ -118,7 +120,48 @@ final class PresetStoreTests: XCTestCase {
         let (loaded, error) = store.loadOrRecover()
         XCTAssertNil(error)
         XCTAssertEqual(loaded.count, 1)
-        XCTAssertEqual(loaded[0].params.sampleRateHz, 0) // 0 = machine default, the documented sentinel
+        // akai.s2000's own maxSampleRateHz -- never 0/bypass.
+        XCTAssertEqual(loaded[0].params.sampleRateHz, 44100)
+    }
+
+    /// A v2 file that DOES have a sampleRateHz key, but with a literal
+    /// stored 0 -- the exact value the field's default and every stored
+    /// preset used to carry before 2.1 (back when 0 meant "bypass the
+    /// rate stage"). Distinct from the absent-key case above: this is
+    /// the migration path that actually matters, since it's the one that
+    /// covers presets genuinely saved by a pre-2.1 build, not just a
+    /// hypothetical pre-sampleRateHz one.
+    func testLiteralZeroSampleRateHzMigratesToMachineMaxRate() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let store = PresetStore(baseDirectory: dir)
+        let fileURL = dir.appendingPathComponent("Patina", isDirectory: true).appendingPathComponent("presets.json")
+        let json = """
+        [
+            {
+                "name": "Bypassed-rate preset",
+                "formatVersion": 2,
+                "machineId": "akai.s900",
+                "engineRawValue": 0,
+                "modeRawValue": 0,
+                "timeFactorPercent": 100,
+                "cycleLengthSamples": 1000,
+                "quality": 10,
+                "width": 10,
+                "transposeSemitones": 0,
+                "filterCutoff01": 1,
+                "filterResonance01": 0,
+                "sampleRateHz": 0
+            }
+        ]
+        """
+        try json.write(to: fileURL, atomically: true, encoding: .utf8)
+
+        let (loaded, error) = store.loadOrRecover()
+        XCTAssertNil(error)
+        XCTAssertEqual(loaded.count, 1)
+        // akai.s900's own maxSampleRateHz (40000) -- not 0, and not some
+        // other machine's max.
+        XCTAssertEqual(loaded[0].params.sampleRateHz, 40000)
     }
 
     func testMultiplePresetsPreserveOrder() {

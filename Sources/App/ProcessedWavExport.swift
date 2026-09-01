@@ -41,6 +41,10 @@ struct ProcessedWavExport: Transferable {
     /// Already-rendered channels matching `snapshot`, if any -- nil means
     /// "render fresh," which _materialize() below does on demand.
     let cachedChannels: [[Float]]?
+    /// Only consulted on a fresh render (cachedChannels was already
+    /// rendered from a trimmed source, so re-trimming it here would
+    /// double-trim). 2.1 feedback ("click and move start point").
+    let startFrame: Int
     let fileName: String
     /// Called once, on the main actor, only when a fresh render actually
     /// happened -- lets ContentView adopt it as the new processedChannels
@@ -61,8 +65,9 @@ struct ProcessedWavExport: Transferable {
         } else {
             let source = self.source
             let params = snapshot.params
+            let startFrame = self.startFrame
             channels = await Task.detached(priority: .userInitiated) {
-                ProcessedRender.render(sample: source, params: params)
+                ProcessedRender.render(sample: source, params: params, startFrame: startFrame)
             }.value
             let rendered = channels
             let snap = snapshot

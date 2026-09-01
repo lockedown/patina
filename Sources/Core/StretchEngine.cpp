@@ -167,6 +167,18 @@ void StretchEngine::setSource(const float* sourceFrames, size_t frameCount) {
     _dirty = true;
 }
 
+void StretchEngine::setSpliceGuide(const std::vector<long long>& offsets) {
+    _spliceGuide = offsets;
+    _hasSpliceGuide = true;
+    _dirty = true;
+}
+
+void StretchEngine::clearSpliceGuide() {
+    _spliceGuide.clear();
+    _hasSpliceGuide = false;
+    _dirty = true;
+}
+
 float StretchEngine::_sourceAt(long long index) const {
     if (index < 0 || index >= static_cast<long long>(_quantizedSource.size())) {
         return 0.0f;
@@ -229,9 +241,11 @@ void StretchEngine::_synthesizeCyclicBlocks(std::vector<float>& out, size_t numO
     }
 }
 
-void StretchEngine::_synthesizeIntelligent(std::vector<float>& out, double ratio, int quality, int width) const {
+void StretchEngine::_synthesizeIntelligent(std::vector<float>& out, double ratio, int quality, int width) {
     const size_t inLen = _quantizedSource.size();
     const IntelligentPlan plan = _planIntelligent(inLen, ratio, quality, width, _sampleRateHz);
+
+    _lastSpliceOffsets.clear();
 
     if (inLen == 0) {
         return;
@@ -247,29 +261,41 @@ void StretchEngine::_synthesizeIntelligent(std::vector<float>& out, double ratio
     // yet to align it against.
     out.insert(out.end(), _quantizedSource.begin(), _quantizedSource.begin() + plan.frameSize);
 
+    _lastSpliceOffsets.reserve(plan.numIterations);
+
     double analysisPos = plan.analysisHop;
     for (size_t iter = 0; iter < plan.numIterations; ++iter, analysisPos += plan.analysisHop) {
         const long long nominalPos = static_cast<long long>(std::llround(analysisPos));
 
-        // Search for the offset whose overlap region best matches the
-        // tail already written -- this IS "intelligently varies the
-        // interpolation rate according to the sample content" (plan
-        // "2.2"): the effective read rate through the source drifts
-        // slightly, iteration to iteration, to keep splices phase-aligned.
         long long bestOffset = 0;
-        double bestScore = -1.0; // dot products of real audio are never below this for a non-trivial overlap
-        const float* outTail = out.data() + out.size() - plan.overlapLen;
-        for (long long delta = -plan.searchRange; delta <= plan.searchRange; ++delta) {
-            const long long candidate = nominalPos + delta;
-            if (candidate < 0 || static_cast<size_t>(candidate) + plan.overlapLen > inLen) {
-                continue;
-            }
-            const double score = _dotProduct(outTail, _quantizedSource.data() + candidate, plan.overlapLen);
-            if (score > bestScore) {
-                bestScore = score;
-                bestOffset = delta;
+        if (_hasSpliceGuide && iter < _spliceGuide.size()) {
+            // 2.1 stereo linkage: use the guide's offset verbatim rather
+            // than searching THIS engine's own content -- see
+            // setSpliceGuide's doc comment. Falls through to the normal
+            // search below only for iterations past the guide's own
+            // length (a defensive mismatch, not the expected case).
+            bestOffset = _spliceGuide[iter];
+        } else {
+            // Search for the offset whose overlap region best matches the
+            // tail already written -- this IS "intelligently varies the
+            // interpolation rate according to the sample content" (plan
+            // "2.2"): the effective read rate through the source drifts
+            // slightly, iteration to iteration, to keep splices phase-aligned.
+            double bestScore = -1.0; // dot products of real audio are never below this for a non-trivial overlap
+            const float* outTail = out.data() + out.size() - plan.overlapLen;
+            for (long long delta = -plan.searchRange; delta <= plan.searchRange; ++delta) {
+                const long long candidate = nominalPos + delta;
+                if (candidate < 0 || static_cast<size_t>(candidate) + plan.overlapLen > inLen) {
+                    continue;
+                }
+                const double score = _dotProduct(outTail, _quantizedSource.data() + candidate, plan.overlapLen);
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestOffset = delta;
+                }
             }
         }
+        _lastSpliceOffsets.push_back(bestOffset);
 
         long long framePos = nominalPos + bestOffset;
         framePos = std::max<long long>(0, std::min(framePos, static_cast<long long>(inLen) - plan.frameSize));
@@ -292,6 +318,11 @@ void StretchEngine::_synthesizeIntelligent(std::vector<float>& out, double ratio
 void StretchEngine::_recompute() {
     _output.clear();
     _readPos = 0;
+    // Cleared unconditionally, not just inside _synthesizeIntelligent:
+    // CYCLIC mode never calls it at all, so a stale offset table from a
+    // PRIOR intelligent render would otherwise linger after a mode
+    // switch. Repopulated below only if effectiveMode is INTELLIGENT.
+    _lastSpliceOffsets.clear();
 
     // Record path (v2 heritage-roster plan, stage 4 -- rate/bandwidth
     // front end; build order stage 6's converter, folded into it): fresh
@@ -299,10 +330,11 @@ void StretchEngine::_recompute() {
     // sample rate AND bit depth -- this models "what this file would
     // sound like sampled into the machine" (this app's whole premise),
     // not a one-way bit-crush/decimate baked in permanently.
-    // resolveSampleRateHz's 0-means-host-rate sentinel is what keeps
-    // this a no-op for every preset/default that predates sampleRateHz
-    // -- see RateModel.h. See ConverterModel.h for what's still not
-    // modelled (companding, DAC low-level distortion -- stage 7).
+    // resolveSampleRateHz always resolves to a real, in-range rate (2.1:
+    // the 0-means-host-rate bypass is gone -- see RateModel.h), so this
+    // stage is now genuinely always engaged, at whatever rate _params
+    // carries. See ConverterModel.h for what's still not modelled
+    // (companding, DAC low-level distortion -- stage 7).
     _quantizedSource = _source;
     const double effectiveRateHz = resolveSampleRateHz(_params.machine, _params.sampleRateHz, _sampleRateHz);
     applyRecordPath(_quantizedSource.data(), _quantizedSource.size(), _params.machine, effectiveRateHz, _sampleRateHz);
@@ -572,7 +604,15 @@ void akz_stretch_params_default(AkzMachine machine, AkzStretchParams* out_params
     out_params->transposeSemitones = 0.0f;
     out_params->filterCutoff01 = 1.0f;   // fully open -- matches the hardware's own "0xffff = Nyquist" default
     out_params->filterResonance01 = 0.0f;
-    out_params->sampleRateHz = 0.0f;     // 0 = machine default -- see AkaizerCore.h
+    // The machine's own top-end rate, not the 0 sentinel: 2.1 feedback
+    // was that bandwidth "never be 0 or bypassed... this is the essence
+    // of the old sampler sound" -- every machine's default rate stage
+    // must actually engage, including fixed-rate machines (SP-1200,
+    // Emulator II) whose single rate IS their defining character.
+    // resolveSampleRateHz (RateModel.cpp) still resolves a literal 0 to
+    // this same value, for old presets going through PresetStore's
+    // migration rather than this path.
+    out_params->sampleRateHz = static_cast<float>(profile.maxSampleRateHz);
 }
 
 AkzStretchEngine* akz_stretch_engine_create(double sampleRateHz) {
@@ -606,4 +646,28 @@ size_t akz_stretch_engine_process(AkzStretchEngine* engine, float* out_frames, s
 size_t akz_stretch_engine_output_length(const AkzStretchEngine* engine) {
     if (!engine) return 0;
     return engine->impl.outputLength();
+}
+
+void akz_stretch_engine_set_splice_guide(AkzStretchEngine* engine, const long long* offsets, size_t offset_count) {
+    if (!engine) return;
+    std::vector<long long> guide(offsets, offsets + offset_count);
+    engine->impl.setSpliceGuide(guide);
+}
+
+void akz_stretch_engine_clear_splice_guide(AkzStretchEngine* engine) {
+    if (!engine) return;
+    engine->impl.clearSpliceGuide();
+}
+
+size_t akz_stretch_engine_last_splice_offset_count(const AkzStretchEngine* engine) {
+    if (!engine) return 0;
+    return engine->impl.lastSpliceOffsets().size();
+}
+
+size_t akz_stretch_engine_get_last_splice_offsets(const AkzStretchEngine* engine, long long* out_offsets, size_t max_count) {
+    if (!engine || !out_offsets) return 0;
+    const std::vector<long long>& offsets = engine->impl.lastSpliceOffsets();
+    const size_t toCopy = std::min(offsets.size(), max_count);
+    std::copy(offsets.begin(), offsets.begin() + static_cast<long>(toCopy), out_offsets);
+    return toCopy;
 }

@@ -6,11 +6,20 @@
 #include "RealtimeStretchPlayer.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace akz {
 
+namespace {
+// 5ms is short enough not to smear a fast cutoff sweep into audible
+// crossfade artefacts of its own, and long enough to hide a hard sample
+// discontinuity -- the standard range for a declick fade.
+constexpr double kCrossfadeSeconds = 0.005;
+}
+
 RealtimeStretchPlayer::RealtimeStretchPlayer(double sampleRateHz)
-    : _engine(sampleRateHz) {
+    : _engine(sampleRateHz),
+      _crossfadeLength(static_cast<size_t>(std::max(1.0, sampleRateHz * kCrossfadeSeconds))) {
     _worker = std::thread(&RealtimeStretchPlayer::_workerLoop, this);
 }
 
@@ -38,15 +47,26 @@ void RealtimeStretchPlayer::setParams(const AkzStretchParams& params) {
     _requestCV.notify_one();
 }
 
+void RealtimeStretchPlayer::setSpliceGuide(const std::vector<long long>& offsets) {
+    std::lock_guard<std::mutex> lock(_requestMutex);
+    _pendingSpliceGuide = offsets;
+    _hasPendingSpliceGuide = true;
+    ++_requestGeneration;
+    _requestCV.notify_one();
+}
+
 void RealtimeStretchPlayer::_workerLoop() {
     uint64_t lastSeenGeneration = 0;
     std::vector<float> localSource;
     AkzStretchParams localParams{};
+    std::vector<long long> localSpliceGuide;
     bool haveSource = false;
     bool haveParams = false;
+    bool haveSpliceGuide = false;
 
     while (true) {
         bool sourceChangedThisIteration = false;
+        bool spliceGuideChangedThisIteration = false;
         {
             std::unique_lock<std::mutex> lock(_requestMutex);
             _requestCV.wait(lock, [&] {
@@ -68,6 +88,12 @@ void RealtimeStretchPlayer::_workerLoop() {
                 haveParams = true;
                 _hasPendingParams = false;
             }
+            if (_hasPendingSpliceGuide) {
+                localSpliceGuide = _pendingSpliceGuide;
+                haveSpliceGuide = true;
+                _hasPendingSpliceGuide = false;
+                spliceGuideChangedThisIteration = true;
+            }
         }
 
         if (!haveSource || !haveParams || localSource.empty()) {
@@ -88,7 +114,11 @@ void RealtimeStretchPlayer::_workerLoop() {
         // transpose. It requires an existing render to redo, and no new
         // source since then (a new source always needs the full path
         // regardless of what the params say).
-        const bool canTakeCheapPath = !sourceChangedThisIteration && _haveRendered
+        // A splice-guide change alone (2.1 stereo linkage) also forces the
+        // full path: the guide only affects INTELLIGENT mode's synthesis
+        // step, which the cheap path (reapplyFilterOnly) never touches --
+        // taking the cheap path here would silently ignore a guide update.
+        const bool canTakeCheapPath = !sourceChangedThisIteration && !spliceGuideChangedThisIteration && _haveRendered
             && StretchEngine::paramsDifferOnlyInFilter(_lastRenderedParams, localParams);
 
         // Only needed by the cheap (filter-only) path below -- see its
@@ -108,6 +138,12 @@ void RealtimeStretchPlayer::_workerLoop() {
             // would do on whatever thread calls it -- here that's always
             // this background thread, never the render thread.
             _engine.reset();
+            // Reapplied on every full recompute, not just when it just
+            // changed -- same reasoning as localParams/localSource above,
+            // which are also always resent regardless of *ThisIteration.
+            if (haveSpliceGuide) {
+                _engine.setSpliceGuide(localSpliceGuide);
+            }
             _engine.setParams(localParams);
             _engine.setSource(localSource.data(), localSource.size());
             const size_t len = _engine.outputLength();
@@ -122,9 +158,20 @@ void RealtimeStretchPlayer::_workerLoop() {
             // resonance only affect sample values, never buffer length)
             // -- leave the read position exactly where it was instead of
             // restarting.
+            //
+            // The outgoing buffer becomes the crossfade-from side: it's
+            // index-aligned with the incoming one (same guarantee that
+            // lets _readPos carry over unchanged), so pull() can blend the
+            // two sample-for-sample instead of stepping straight to the
+            // new one.
+            std::shared_ptr<const std::vector<float>> outgoing = std::atomic_load(&_published);
             std::atomic_store(&_published, std::shared_ptr<const std::vector<float>>(rendered));
             const size_t newLen = rendered->size();
             _readPos.store(newLen > 0 ? std::min(oldPos, newLen - 1) : 0, std::memory_order_relaxed);
+            if (outgoing && !outgoing->empty()) {
+                std::atomic_store(&_crossfadeFrom, outgoing);
+                _crossfadeRemaining.store(std::min(_crossfadeLength, newLen), std::memory_order_relaxed);
+            }
         } else {
             // A stretch/cycle/mode/transpose change can change the buffer
             // length, which means the read position has to reset to a
@@ -172,16 +219,47 @@ size_t RealtimeStretchPlayer::pull(float* outFrames, size_t maxOutFrames) {
 
     size_t pos = _readPos.load(std::memory_order_relaxed);
     const size_t bufLen = buf->size();
+
+    size_t crossfadeRemaining = _crossfadeRemaining.load(std::memory_order_relaxed);
+    std::shared_ptr<const std::vector<float>> crossfadeFrom =
+        crossfadeRemaining > 0 ? std::atomic_load(&_crossfadeFrom) : nullptr;
+
     for (size_t i = 0; i < maxOutFrames; ++i) {
-        outFrames[i] = (*buf)[pos];
+        const float newSample = (*buf)[pos];
+        if (crossfadeFrom && crossfadeRemaining > 0 && pos < crossfadeFrom->size()) {
+            // Equal-power fade: gains are sqrt(t)/sqrt(1-t) rather than a
+            // straight linear ramp, so the perceived loudness through the
+            // blend stays constant instead of dipping at the midpoint.
+            const double t = 1.0 - static_cast<double>(crossfadeRemaining) / static_cast<double>(_crossfadeLength);
+            const float gainOld = static_cast<float>(std::sqrt(std::max(0.0, 1.0 - t)));
+            const float gainNew = static_cast<float>(std::sqrt(std::max(0.0, t)));
+            outFrames[i] = gainOld * (*crossfadeFrom)[pos] + gainNew * newSample;
+            --crossfadeRemaining;
+        } else {
+            outFrames[i] = newSample;
+        }
         pos = (pos + 1 == bufLen) ? 0 : pos + 1; // loop -- audition plays continuously, not one-shot
     }
     _readPos.store(pos, std::memory_order_relaxed);
+    _crossfadeRemaining.store(crossfadeRemaining, std::memory_order_relaxed);
     return maxOutFrames;
 }
 
 bool RealtimeStretchPlayer::isReady() const {
     return std::atomic_load(&_published) != nullptr;
+}
+
+double RealtimeStretchPlayer::readPosition01() const {
+    std::shared_ptr<const std::vector<float>> buf = std::atomic_load(&_published);
+    if (!buf || buf->empty()) {
+        return 0.0;
+    }
+    const size_t pos = _readPos.load(std::memory_order_relaxed);
+    // pos is a loop cursor into buf and is always < buf->size() by
+    // construction (pull()'s wraparound, or 0 immediately after a
+    // publish/commit) -- clamped defensively anyway rather than trusting
+    // that invariant across a future change.
+    return static_cast<double>(std::min(pos, buf->size() - 1)) / static_cast<double>(buf->size());
 }
 
 bool RealtimeStretchPlayer::hasPendingCommit() const {
@@ -235,6 +313,12 @@ void akz_realtime_player_set_params(AkzRealtimePlayer* player, const AkzStretchP
     player->impl.setParams(*params);
 }
 
+void akz_realtime_player_set_splice_guide(AkzRealtimePlayer* player, const long long* offsets, size_t offset_count) {
+    if (!player) return;
+    std::vector<long long> guide(offsets, offsets + offset_count);
+    player->impl.setSpliceGuide(guide);
+}
+
 size_t akz_realtime_player_pull(AkzRealtimePlayer* player, float* out_frames, size_t max_out_frames) {
     if (!player) return 0;
     return player->impl.pull(out_frames, max_out_frames);
@@ -243,6 +327,11 @@ size_t akz_realtime_player_pull(AkzRealtimePlayer* player, float* out_frames, si
 int akz_realtime_player_is_ready(const AkzRealtimePlayer* player) {
     if (!player) return 0;
     return player->impl.isReady() ? 1 : 0;
+}
+
+double akz_realtime_player_read_position01(const AkzRealtimePlayer* player) {
+    if (!player) return 0.0;
+    return player->impl.readPosition01();
 }
 
 int akz_realtime_player_has_pending_commit(const AkzRealtimePlayer* player) {
