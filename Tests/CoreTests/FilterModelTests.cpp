@@ -163,13 +163,27 @@ AKZ_TEST(resonant_machine_cutoff_reaches_above_the_old_8khz_ceiling) {
     AKZ_CHECK(passedRms > referenceRms * 0.7); // meaningfully passed through, not still capped near 8kHz
 }
 
-AKZ_TEST(resonant_peak_never_exceeds_unity_at_full_compensation) {
+AKZ_TEST(resonant_peak_stays_below_digital_full_scale_at_full_compensation) {
     // filterResonanceCompensation01 == 1.0 for S2000/S3000/S3200 (full
-    // compensation) -- the whole point of the fix. Sweep cutoff across
-    // the range at maximum resonance and confirm the output peak never
-    // exceeds the input peak, which the old uncompensated clamp could
-    // not guarantee (the original bug report: an 0.8-amplitude 440Hz
-    // tone came out peaking at 1.135).
+    // compensation) -- the whole point of the original TPT SVF fix,
+    // which was to stop an uncompensated resonant peak clipping (the
+    // original bug report: an 0.8-amplitude 440Hz tone came out peaking
+    // at 1.135).
+    //
+    // [user feedback, 2026-09] rewrote the *shape* of that guarantee:
+    // full compensation used to hold the resonant peak at-or-below the
+    // INPUT amplitude, by scaling the whole broadband signal down by
+    // 1/peakGain -- which is also what made every resonant machine
+    // noticeably quieter overall, not just at the peak (input-scale and
+    // output-scale are mathematically the same thing in a linear
+    // filter). FilterModel.cpp's TptSvf/SsmLadder now claw back half of
+    // that (in dB) as output makeup gain, restoring most of the lost
+    // loudness, and rely on a soft-knee limiter -- not the input scale
+    // alone -- to keep the now-boosted peak off the digital ceiling.
+    // So the peak CAN exceed the input amplitude now (that's the fix),
+    // but must still never reach full scale (1.0) -- no hard clipping,
+    // ever, which is the guarantee that actually matters downstream
+    // through PCMConversion.matchedGain.
     const double sampleRate = 44100.0;
     const float inputAmplitude = 0.8f;
     for (float cutoff01 = 0.1f; cutoff01 <= 1.0f; cutoff01 += 0.15f) {
@@ -180,7 +194,7 @@ AKZ_TEST(resonant_peak_never_exceeds_unity_at_full_compensation) {
         for (size_t i = 1000; i < buf.size(); ++i) { // skip startup transient
             peak = std::max(peak, std::fabs(buf[i]));
         }
-        AKZ_CHECK(peak <= inputAmplitude * 1.05); // full compensation -- allow a hair of numerical slack, not a real margin
+        AKZ_CHECK(peak <= 1.0f + 1e-4f); // soft-knee ceiling -- allow a hair of numerical slack, not a real margin
     }
 }
 
@@ -205,16 +219,22 @@ AKZ_TEST(tpt_svf_stability_sweep_every_resonance_code_stays_finite) {
 }
 
 AKZ_TEST(tpt_svf_dc_gain_matches_the_documented_compensation_formula) {
-    // The raw zero-delay-feedback SVF has unity DC gain for any k > 0 --
-    // but filterResonanceCompensation01 == 1.0 (S2000/S3000/S3200)
-    // deliberately scales the WHOLE signal path (input and output gain
-    // are mathematically equivalent for a linear filter) by
-    // 1 / (1 + c*(peakGain-1)), per FilterModel.cpp's own doc comment --
-    // so full compensation trades away unity DC gain in exchange for
-    // never clipping at the resonant peak, a real design tradeoff, not
-    // a bug. At resonance01 == 0 there is no peak to compensate
-    // (peakGain == 1), so compensation has zero effect regardless of the
-    // profile's setting, and DC gain must be exactly unity.
+    // The raw zero-delay-feedback SVF has unity DC gain for any k > 0.
+    // filterResonanceCompensation01 == 1.0 (S2000/S3000/S3200) still
+    // computes the same full input-side attenuation as before --
+    // 1 / (1 + c*(peakGain-1)) -- to guarantee the resonant peak itself
+    // never clips, but [user feedback, 2026-09] added an output-side
+    // makeup gain of sqrt(1/inputScale) (half the compensation, in dB,
+    // clawed back) so full compensation no longer quiets the WHOLE
+    // signal by the full 1/peakGain -- only by its square root. DC is
+    // far from any resonant peak and well under the soft-knee's 0.98
+    // threshold at these amplitudes, so the makeup applies linearly
+    // here with no saturation.
+    //
+    // At resonance01 == 0 there is no peak to compensate (peakGain ==
+    // 1), so both the input scale and the output makeup are exactly 1
+    // regardless of the profile's setting, and DC gain must be exactly
+    // unity.
     const double sampleRate = 44100.0;
 
     {
@@ -224,12 +244,13 @@ AKZ_TEST(tpt_svf_dc_gain_matches_the_documented_compensation_formula) {
     }
     {
         // resonanceCode 15 -> damping 1/16 -> k = 0.125 -> peakGain = 8
-        // -> inputScale = 1/(1 + 1.0*(8-1)) = 0.125, matching
-        // AkzMachineProfile.filterResonanceCompensation01 == 1.0 for
-        // S3000 -- see MachineProfile.cpp.
+        // -> inputScale = 1/(1 + 1.0*(8-1)) = 0.125 (unchanged) ->
+        // outputMakeup = sqrt(1/0.125) = sqrt(8) ~= 2.828427 -> net DC
+        // gain = 0.125 * sqrt(8) ~= 0.353553 (was 0.125 pre-makeup --
+        // about -9dB instead of -18dB).
         std::vector<float> buf(4000, 0.5f);
         applyFilter(buf.data(), buf.size(), AkzMachine_S3000, 0.5f, 1.0f, sampleRate, 1.0);
-        AKZ_CHECK_NEAR(buf.back(), 0.5 * 0.125, 1e-3);
+        AKZ_CHECK_NEAR(buf.back(), 0.5 * 0.125 * std::sqrt(8.0), 1e-3);
     }
 }
 
