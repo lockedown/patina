@@ -172,13 +172,15 @@ AKZ_TEST(realtime_player_filter_only_change_does_not_reset_read_position) {
     AKZ_CHECK_EQ(got, static_cast<size_t>(500));
 
     // Filter-only change: everything else identical, only cutoff moves.
+    // [user feedback, 2026-09]: filter-only changes now go through the
+    // same cross-channel commit gate as stretch-affecting ones (see
+    // RealtimeStretchPlayer.cpp's _workerLoop()), so -- same as every
+    // other test here past the first render -- an explicit commit is
+    // required before the change is visible to pull().
     params.filterCutoff01 = 0.5f;
     akz_realtime_player_set_params(player, &params);
-    // No completion signal is exposed for "this specific recompute
-    // finished" (is_ready() only ever means "something has published, at
-    // some point") -- a fixed, generous sleep stands in, well beyond what
-    // a background thread needs to filter a 2000-sample buffer.
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    waitForPendingCommit(player);
+    akz_realtime_player_commit_pending(player);
 
     float one[1];
     akz_realtime_player_pull(player, one, 1);
@@ -233,9 +235,12 @@ AKZ_TEST(realtime_player_filter_only_change_crossfades_instead_of_stepping) {
     akz_realtime_player_pull(player, discard, 1000);
 
     // Filter-only change: heavy low-pass, so old vs. new clearly differ.
+    // [user feedback, 2026-09]: now needs an explicit commit, same as
+    // above -- see that test's comment.
     params.filterCutoff01 = 0.05f;
     akz_realtime_player_set_params(player, &params);
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    waitForPendingCommit(player);
+    akz_realtime_player_commit_pending(player);
 
     AkzStretchEngine* newOffline = akz_stretch_engine_create(44100.0);
     akz_stretch_engine_set_params(newOffline, &params);

@@ -121,11 +121,6 @@ void RealtimeStretchPlayer::_workerLoop() {
         const bool canTakeCheapPath = !sourceChangedThisIteration && !spliceGuideChangedThisIteration && _haveRendered
             && StretchEngine::paramsDifferOnlyInFilter(_lastRenderedParams, localParams);
 
-        // Only needed by the cheap (filter-only) path below -- see its
-        // comment, and the one on the full-re-render path, for why the
-        // full path deliberately does NOT read or reuse this.
-        const size_t oldPos = _readPos.load(std::memory_order_relaxed);
-
         std::shared_ptr<std::vector<float>> rendered;
         if (canTakeCheapPath) {
             _engine.reapplyFilterOnly(localParams);
@@ -152,57 +147,42 @@ void RealtimeStretchPlayer::_workerLoop() {
             rendered->resize(written);
         }
 
-        if (canTakeCheapPath) {
-            // Filter/resonance-only: publish immediately, no cross-channel
-            // coordination needed. Same length by construction (filter/
-            // resonance only affect sample values, never buffer length)
-            // -- leave the read position exactly where it was instead of
-            // restarting.
-            //
-            // The outgoing buffer becomes the crossfade-from side: it's
-            // index-aligned with the incoming one (same guarantee that
-            // lets _readPos carry over unchanged), so pull() can blend the
-            // two sample-for-sample instead of stepping straight to the
-            // new one.
-            std::shared_ptr<const std::vector<float>> outgoing = std::atomic_load(&_published);
-            std::atomic_store(&_published, std::shared_ptr<const std::vector<float>>(rendered));
-            const size_t newLen = rendered->size();
-            _readPos.store(newLen > 0 ? std::min(oldPos, newLen - 1) : 0, std::memory_order_relaxed);
-            if (outgoing && !outgoing->empty()) {
-                std::atomic_store(&_crossfadeFrom, outgoing);
-                _crossfadeRemaining.store(std::min(_crossfadeLength, newLen), std::memory_order_relaxed);
-            }
-        } else {
-            // A stretch/cycle/mode/transpose change can change the buffer
-            // length, which means the read position has to reset to a
-            // fixed point (0) rather than remap proportionally -- see the
-            // now-historical version of this comment in git blame for the
-            // permanent-desync bug that reasoning fixed. But resetting
-            // _readPos here, the instant THIS channel's own worker
-            // finishes, has a bug of its own: LiveAuditionController runs
-            // one independent RealtimeStretchPlayer PER CHANNEL, each
-            // with its own worker thread racing the others. Whichever
-            // channel's worker finishes first would swap to the new
-            // (possibly different-length/content) buffer and start
-            // playing it from 0, while a sibling channel -- still
-            // finishing the SAME change -- keeps playing the OLD buffer
-            // for however long that gap lasts. For that whole window the
-            // channels are playing genuinely different audio
-            // simultaneously: heard as artificial stereo width, on every
-            // stretch-affecting knob (Transpose, Stretch, Cycle, Quality,
-            // Width, Mode), not just the one that happened to be under
-            // test when this was last diagnosed.
-            //
-            // So: stash the render as PENDING instead of publishing it.
-            // commitPending() (render-thread safe) does the actual
-            // publish + readPos reset, and LiveAuditionController's
-            // render callback only calls it once every sibling channel
-            // also has a pending commit ready -- committing all channels
-            // together, in the same callback invocation, so every
-            // channel's readPos hits 0 on the exact same audio frame
-            // instead of whenever its own worker happened to finish.
-            std::atomic_store(&_pendingPublish, std::shared_ptr<const std::vector<float>>(rendered));
-        }
+        // Stash the render as PENDING rather than publishing it here,
+        // regardless of which path produced it. A stretch/cycle/mode/
+        // transpose change can change the buffer length, which means the
+        // read position has to reset to a fixed point (0) rather than
+        // remap proportionally -- see the now-historical version of this
+        // comment in git blame for the permanent-desync bug that
+        // reasoning fixed. But publishing (of either kind) here, the
+        // instant THIS channel's own worker finishes, has a bug of its
+        // own: LiveAuditionController runs one independent
+        // RealtimeStretchPlayer PER CHANNEL, each with its own worker
+        // thread racing the others. Whichever channel's worker finishes
+        // first would swap in its new buffer immediately, while a
+        // sibling channel -- still finishing the SAME change -- keeps
+        // playing the OLD one for however long that gap lasts. For that
+        // whole window the channels are playing genuinely different
+        // audio simultaneously: heard as artificial stereo width/phasing,
+        // on every knob that reaches this far, stretch-affecting
+        // (Transpose, Stretch, Cycle, Quality, Width, Mode) or, [user
+        // feedback, 2026-09] equally, filter-only (Cutoff, Resonance) --
+        // the cheap path used to publish straight to _published on the
+        // theory that a same-length, position-preserving change needed
+        // no cross-channel coordination, which is true of ITS OWN
+        // published content but not of WHEN it becomes audible relative
+        // to a sibling channel's own cheap-path render of the same knob
+        // move.
+        //
+        // So every render, cheap or full, goes through this same pending
+        // slot now. commitPending() (render-thread safe) does the actual
+        // publish, and LiveAuditionController's render callback only
+        // calls it once every sibling channel also has a pending commit
+        // ready -- committing all channels together, in the same
+        // callback invocation, so the swap lands on the exact same audio
+        // frame for every channel instead of whenever each one's own
+        // worker happened to finish.
+        _pendingIsFilterOnly.store(canTakeCheapPath, std::memory_order_seq_cst);
+        std::atomic_store(&_pendingPublish, std::shared_ptr<const std::vector<float>>(rendered));
 
         _lastRenderedParams = localParams;
         _haveRendered = true;
@@ -273,11 +253,40 @@ bool RealtimeStretchPlayer::isRecomputing() const {
 void RealtimeStretchPlayer::commitPending() {
     std::shared_ptr<const std::vector<float>> pending = std::atomic_load(&_pendingPublish);
     if (!pending) return;
-    std::atomic_store(&_published, pending);
-    _readPos.store(0, std::memory_order_relaxed);
+    // Loaded after the (non-null) pointer, matching how the worker wrote
+    // them (flag before pointer) -- see _pendingIsFilterOnly's comment.
+    const bool filterOnly = _pendingIsFilterOnly.load(std::memory_order_seq_cst);
+
+    if (filterOnly) {
+        // Same length as the outgoing buffer by construction (filter/
+        // resonance only affect sample values, never buffer length), so
+        // preserve the read position instead of restarting, and crossfade
+        // from the outgoing buffer rather than stepping straight to the
+        // new one -- same reasoning as the old immediate-publish cheap
+        // path, just executed here instead of the instant the worker
+        // finished. Reading _readPos fresh here (not a value the worker
+        // captured back when it started rendering) is actually more
+        // correct than the old code was: playback keeps advancing
+        // against the still-published OLD buffer for however long this
+        // commit was waiting on a sibling channel, and that advancement
+        // must not be discarded.
+        std::shared_ptr<const std::vector<float>> outgoing = std::atomic_load(&_published);
+        std::atomic_store(&_published, pending);
+        const size_t oldPos = _readPos.load(std::memory_order_relaxed);
+        const size_t newLen = pending->size();
+        _readPos.store(newLen > 0 ? std::min(oldPos, newLen - 1) : 0, std::memory_order_relaxed);
+        if (outgoing && !outgoing->empty()) {
+            std::atomic_store(&_crossfadeFrom, outgoing);
+            _crossfadeRemaining.store(std::min(_crossfadeLength, newLen), std::memory_order_relaxed);
+        }
+    } else {
+        std::atomic_store(&_published, pending);
+        _readPos.store(0, std::memory_order_relaxed);
+    }
+
     // Clear it rather than leave the stale pointer around -- otherwise a
     // second commitPending() call with no new render in between would
-    // re-publish (harmlessly, since it's the same buffer + already-0
+    // re-publish (harmlessly, since it's the same buffer + already-settled
     // position) but hasPendingCommit() would keep reporting true forever,
     // which would make the caller believe a fresh render is still
     // waiting when none is.
