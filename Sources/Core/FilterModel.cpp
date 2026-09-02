@@ -37,6 +37,39 @@ double _mapCutoff01ToHz(float cutoff01, double sampleRateHz) {
     return 20.0 * std::pow(nyquist / 20.0, c);
 }
 
+// Soft-knee limiter for the resonance output-makeup gain below (TptSvf,
+// SsmLadder): identity for |x| <= kSoftKneeThreshold, smoothly
+// asymptoting toward +-1.0 above it (tanh on the excess, normalised by
+// the remaining headroom). Below the knee this is completely
+// transparent -- normal, non-resonant-peak content passes through
+// bit-for-bit unaffected. Only a makeup-boosted resonant peak that
+// would otherwise exceed the input-scale's own headroom gets gently
+// saturated, never reaching full digital scale.
+//
+// [user feedback, 2026-09] resonance made the WHOLE signal quieter:
+// full compensation (filterResonanceCompensation01 == 1.0, every
+// resonant machine) scaled the entire broadband input down by up to
+// 1/peakGain (-18dB at max resonance) to guarantee the resonant peak
+// never clipped -- see TptSvf/SsmLadder's _inputScale comments. That
+// input-side scale is mathematically equivalent to an output-side scale
+// for a linear filter, so it hit content far from the resonant peak
+// exactly as hard as the peak itself. This limiter is what makes it
+// possible to claw some of that back at the output (see
+// _outputMakeup below) without reintroducing the original clipping bug
+// the TPT SVF migration fixed: FilterModelTests.cpp's
+// "resonant_peak_stays_below_digital_full_scale_at_full_compensation"
+// pins the new, slightly looser guarantee (never reaches unity, not
+// "never exceeds input amplitude").
+constexpr double kSoftKneeThreshold = 0.98;
+double _softKneeLimit(double x) {
+    const double ax = std::fabs(x);
+    if (ax <= kSoftKneeThreshold) return x;
+    const double headroom = 1.0 - kSoftKneeThreshold;
+    const double excess = ax - kSoftKneeThreshold;
+    const double compressed = kSoftKneeThreshold + headroom * std::tanh(excess / headroom);
+    return std::copysign(compressed, x);
+}
+
 // A cascade of identical one-pole lowpass stages -- the simple,
 // real-time-safe stand-in for the S900/S950 analog (36 dB/oct) and
 // S1000 digital (18 dB/oct) filters. This is NOT a precision Butterworth
@@ -169,10 +202,26 @@ public:
         // loudness match. resonanceCompensation01 (AkzMachineProfile,
         // [I] -- no manual specifies this) interpolates between 0 (no
         // compensation, the peak passes through at full height) and 1
-        // (full compensation, output peak held at unity even at
-        // maximum resonance).
+        // (full compensation).
+        //
+        // Split, not all-input: the full amount (peakGain, at
+        // resonanceCompensation01 == 1) is still taken out at the input
+        // -- _inputScale below is UNCHANGED from the original fix, so
+        // the resonant peak's own headroom guarantee doesn't regress.
+        // But taking 100% of a linear compensation out at the input is
+        // equivalent to taking it out at the output (same math, any
+        // point in a linear chain), which is exactly why full
+        // compensation made the WHOLE signal quieter, not just the
+        // resonant peak -- [user feedback, 2026-09]. _outputMakeup below
+        // claws back the geometric-mean half of that (sqrt, i.e. half
+        // the compensation in dB) at the output instead, restoring most
+        // of the broadband loudness; _softKneeLimit (above) is what
+        // keeps the resonant peak itself from clipping now that the
+        // output side is no longer just handing back exactly what the
+        // input side removed.
         const double peakGain = std::max(1.0, 1.0 / std::max(_k, 1e-6));
         _inputScale = 1.0 / (1.0 + resonanceCompensation01 * (peakGain - 1.0));
+        _outputMakeup = std::sqrt(1.0 / _inputScale);
     }
 
     float process(float x) override {
@@ -182,13 +231,19 @@ public:
         const double v2 = _ic2eq + _a2 * _ic1eq + _a3 * v3;
         _ic1eq = 2.0 * v1 - _ic1eq;
         _ic2eq = 2.0 * v2 - _ic2eq;
-        return static_cast<float>(v2); // lowpass output, same choice as ChamberlinSVF
+        // lowpass output, same choice as ChamberlinSVF -- makeup gain
+        // restores broadband loudness lost to the input-side
+        // compensation above; the soft-knee keeps the resonant peak
+        // itself bounded now that the makeup isn't just undoing that
+        // compensation 1:1.
+        return static_cast<float>(_softKneeLimit(v2 * _outputMakeup));
     }
 
 private:
     double _k = 2.0;
     double _a1 = 0.0, _a2 = 0.0, _a3 = 0.0;
     double _inputScale = 1.0;
+    double _outputMakeup = 1.0;
     double _ic1eq = 0.0, _ic2eq = 0.0;
 };
 
@@ -229,9 +284,15 @@ public:
         // Passband-gain compensation, same rationale/formula as TptSvf
         // -- peakGain approximated from the resonance amount rather
         // than derived analytically (the tanh nonlinearity makes an
-        // exact closed form impractical); [I].
+        // exact closed form impractical); [I]. Same input/output split
+        // as TptSvf too (see its constructor comment): _inputScale is
+        // unchanged, _outputMakeup claws back the sqrt-half at the
+        // output so full compensation doesn't quiet the whole signal,
+        // and _softKneeLimit (applied in process(), below) keeps the
+        // now-boosted resonant peak from clipping.
         const double peakGain = std::max(1.0, 1.0 + _resonanceAmount * 0.9);
         _inputScale = 1.0 / (1.0 + resonanceCompensation01 * (peakGain - 1.0));
+        _outputMakeup = std::sqrt(1.0 / _inputScale);
     }
 
     float process(float x) override {
@@ -251,13 +312,14 @@ public:
             s = std::max(-kStateLimit, std::min(kStateLimit, s));
         }
 
-        return static_cast<float>(_stage[3]);
+        return static_cast<float>(_softKneeLimit(_stage[3] * _outputMakeup));
     }
 
 private:
     double _g = 0.0;
     double _resonanceAmount = 0.0;
     double _inputScale = 1.0;
+    double _outputMakeup = 1.0;
     double _stage[4] = {0.0, 0.0, 0.0, 0.0};
 };
 

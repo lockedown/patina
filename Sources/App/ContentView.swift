@@ -193,6 +193,18 @@ struct ContentView: View {
         _hasModeSwitch && selectedMode == AkzStretchMode_Intelligent
     }
 
+    /// "1.2.3 (45)" from Info.plist's CFBundleShortVersionString/
+    /// CFBundleVersion -- [user feedback, 2026-09]: no version number
+    /// was shown anywhere in the UI. Falls back to just "?" for either
+    /// half if Info.plist is somehow missing it (e.g. a non-bundled
+    /// debug build), rather than showing nothing or crashing.
+    private var _appVersionString: String {
+        let info = Bundle.main.infoDictionary
+        let shortVersion = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        return "v\(shortVersion) (\(build))"
+    }
+
     /// LCD readout content -- see LCDReadoutView.swift. Field names
     /// deliberately echo the real S3200XL time-stretch screen's own
     /// lowercase "label: value" convention from the project research,
@@ -857,8 +869,14 @@ struct ContentView: View {
                 }
             }
 
-            Text(statusMessage)
-                .font(.callout)
+            HStack {
+                Text(statusMessage)
+                    .font(.callout)
+                Spacer()
+                Text(_appVersionString)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             }
             .padding(20)
             .frame(maxWidth: .infinity, alignment: .topLeading)
