@@ -73,12 +73,19 @@ public:
     // AkaizerCore.h's comment on akz_realtime_player_is_recomputing).
     bool isRecomputing() const;
 
-    // Render-thread safe: swaps the pending stretch-affecting re-render
-    // into the published buffer and resets the read position to 0.
-    // No-op if nothing is pending. The caller MUST only call this once
-    // every sibling channel's hasPendingCommit() is also true, and MUST
-    // commit every channel in the same render-callback invocation --
-    // see LiveAuditionController.swift's render callback.
+    // Render-thread safe: swaps the pending re-render into the
+    // published buffer. No-op if nothing is pending. The caller MUST
+    // only call this once every sibling channel's hasPendingCommit() is
+    // also true, and MUST commit every channel in the same
+    // render-callback invocation -- see LiveAuditionController.swift's
+    // render callback. This applies equally to a filter-only change now
+    // (see _pendingIsFilterOnly below) as to a stretch-affecting one --
+    // both need every channel to swap in the same audio frame, just
+    // with different post-swap behaviour: a stretch-affecting commit
+    // resets the read position to 0 (buffer length may have changed);
+    // a filter-only commit preserves the current read position and
+    // crossfades from the outgoing buffer instead (same length by
+    // construction, so no reset is needed and a hard step would click).
     void commitPending();
 
 private:
@@ -147,13 +154,30 @@ private:
     std::atomic<size_t> _crossfadeRemaining{0};
     size_t _crossfadeLength = 0;
 
-    // Worker -> render-thread handoff for a stretch-affecting re-render,
-    // held here rather than published/committed directly -- see
-    // commitPending()'s comment above for why. Filter-only cheap-path
-    // renders skip this entirely and publish straight to _published,
-    // since they never touch length or read position and so need no
-    // cross-channel gating.
+    // Worker -> render-thread handoff, held here rather than published
+    // directly -- see commitPending()'s comment above for why. The
+    // filter-only cheap path used to skip this and publish straight to
+    // _published on the theory that same-length, position-preserving
+    // changes need no cross-channel gating -- wrong: nothing stopped
+    // channel A's worker from publishing a new resonance value before
+    // channel B's had, so for the gap between the two, L and R were
+    // genuinely filtered with different resonance settings -- an
+    // audible stereo image shift on every resonance/cutoff drag, same
+    // class of bug as the stretch-affecting race below, just previously
+    // masked by how quiet high resonance used to render (see
+    // FilterModel.cpp's makeup-gain fix). Both paths now go through this
+    // same pending slot and _pendingIsFilterOnly below.
     std::shared_ptr<const std::vector<float>> _pendingPublish;
+
+    // Set alongside _pendingPublish so commitPending() knows which of
+    // the two publish behaviours to run: filter-only preserves the read
+    // position and crossfades from the outgoing buffer (see
+    // commitPending()'s comment), a stretch-affecting change resets to
+    // 0 with no crossfade. Written by the worker thread before
+    // _pendingPublish (so a render thread that observes a non-null
+    // _pendingPublish is guaranteed -- both are seq_cst -- to see the
+    // matching flag), read only by commitPending().
+    std::atomic<bool> _pendingIsFilterOnly{false};
 };
 
 } // namespace akz

@@ -50,21 +50,27 @@ public final class LiveAuditionController {
 
         sourceNode = AVAudioSourceNode(format: format) { _, _, frameCount, audioBufferList in
             // Cross-channel commit gate. Each channel's RealtimePlayer
-            // re-renders a stretch-affecting change (Transpose, Stretch,
-            // Cycle, Quality, Width, Mode) on its own independent worker
+            // re-renders any change -- stretch-affecting (Transpose,
+            // Stretch, Cycle, Quality, Width, Mode) or filter-only
+            // (Cutoff, Resonance) -- on its own independent worker
             // thread, so one channel can finish before another. Letting
             // each player swap its own new buffer in the moment ITS OWN
             // worker finishes -- the old behaviour -- meant one channel
             // could already be playing the new render while a sibling
             // was still finishing the SAME change on the old one: two
             // genuinely different signals playing at once, heard as
-            // artificial stereo width, on every stretch-affecting knob
-            // (see RealtimeStretchPlayer.cpp's _workerLoop() for the full
+            // artificial stereo width/phasing, on every knob that reaches
+            // this far -- [user feedback, 2026-09]: previously true of
+            // resonance too, just masked by how quiet high resonance used
+            // to render (see FilterModel.cpp's makeup-gain fix and
+            // RealtimeStretchPlayer.cpp's _workerLoop() for the full
             // writeup). Only commit once every channel has a pending
             // render ready, and commit all of them right here, in this
-            // one callback invocation -- so every channel's read
-            // position resets to 0 on the exact same audio frame instead
-            // of whenever its own worker happened to finish.
+            // one callback invocation -- so every channel's swap (read
+            // position reset for a stretch-affecting change, or
+            // crossfade-in-place for a filter-only one) lands on the
+            // exact same audio frame instead of whenever its own worker
+            // happened to finish.
             if !players.isEmpty && players.allSatisfy({ $0.hasPendingCommit }) {
                 for player in players { player.commitPending() }
             }
