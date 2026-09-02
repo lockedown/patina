@@ -34,9 +34,25 @@ public:
     void setSource(const float* frames, size_t frameCount);
     void setParams(const AkzStretchParams& params);
 
+    // 2.1 stereo splice linkage -- see StretchEngine::setSpliceGuide's doc
+    // comment. Requests a background recompute the same way setSource/
+    // setParams do; persists across subsequent full recomputes (the
+    // worker reapplies it every time, same as it does localParams/
+    // localSource) until a later call replaces it.
+    void setSpliceGuide(const std::vector<long long>& offsets);
+
     // -- render thread safe -------------------------------------------------
     size_t pull(float* outFrames, size_t maxOutFrames);
     bool isReady() const;
+
+    // Render-thread safe, non-blocking. 2.1 feedback ("show playback bar
+    // over sample waveform"): normalised [0, 1) read position into the
+    // currently published buffer, for a live-audition playhead. Computed
+    // here (position and length loaded together, in one call) rather
+    // than exposed as two separate getters -- two calls could tear
+    // across a worker's commitPending() swap and briefly disagree,
+    // landing outside [0, 1). Returns 0.0 before the first publish.
+    double readPosition01() const;
 
     // Render-thread safe, non-blocking: true once a stretch-affecting
     // re-render has finished on the worker thread and is waiting to be
@@ -83,8 +99,10 @@ private:
     std::condition_variable _requestCV;
     std::vector<float> _pendingSource;
     AkzStretchParams _pendingParams{};
+    std::vector<long long> _pendingSpliceGuide;
     bool _hasPendingParams = false;
     bool _hasPendingSource = false;
+    bool _hasPendingSpliceGuide = false;
     uint64_t _requestGeneration = 0;
 
     // Worker-thread-only bookkeeping (never touched from the main thread,
@@ -112,6 +130,22 @@ private:
     // strict wait-free lock-free code.
     std::shared_ptr<const std::vector<float>> _published;
     std::atomic<size_t> _readPos{0};
+
+    // 2.1 feedback ("Cutoff use during preview creates clicks... on longer
+    // samples"): the cheap filter-only path (see _workerLoop) swaps a
+    // freshly refiltered buffer into _published while playback is
+    // mid-stream, with no crossfade -- an audible step at the swap point,
+    // worse the longer the buffer (more likely a play position lands
+    // right on a swap during a knob drag). Since reapplyFilterOnly can't
+    // change length, the outgoing and incoming buffers are index-aligned,
+    // so pull() can blend old->new sample-for-sample at the same _readPos
+    // it's already walking, over a short window starting the instant the
+    // swap happens -- exactly where the click actually occurs, unlike a
+    // worker-side fade which would be aligned to whenever the worker
+    // guessed playback had reached, not where it really was.
+    std::shared_ptr<const std::vector<float>> _crossfadeFrom;
+    std::atomic<size_t> _crossfadeRemaining{0};
+    size_t _crossfadeLength = 0;
 
     // Worker -> render-thread handoff for a stretch-affecting re-render,
     // held here rather than published/committed directly -- see

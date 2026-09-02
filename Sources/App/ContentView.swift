@@ -41,7 +41,12 @@ struct ContentView: View {
     @State private var statusMessage: String = "No file loaded."
     @State private var lastVerifyResult: String?
 
-    @State private var selectedMachine: AkzMachine = AkzMachine_S950
+    /// Shared by selectedMachine's and sampleRateHz's own initialisers
+    /// below, so the two can't drift: sampleRateHz's default must always
+    /// be THIS machine's own top-end rate, not some other machine's.
+    private static let initialMachine: AkzMachine = AkzMachine_S950
+
+    @State private var selectedMachine: AkzMachine = Self.initialMachine
     @State private var selectedEngine: AkzEngine = AkzEngine_Classic
     @State private var selectedMode: AkzStretchMode = AkzStretchMode_Cyclic
     @State private var stretchPercent: Double = 100
@@ -51,10 +56,11 @@ struct ContentView: View {
     @State private var transposeSemitones: Double = 0
     @State private var filterCutoff: Double = 1.0
     @State private var filterResonance: Double = 0.0
-    /// 0 = machine default. No UI control sets this yet -- heritage-
-    /// roster plan stages 4/9 add the bandwidth knob; wired through the
-    /// snapshot/undo/preset machinery now so that lands additively.
-    @State private var sampleRateHz: Double = 0
+    /// The bandwidth knob's rate, in Hz -- always real and in-range,
+    /// never 0/bypass (2.1 feedback: "this is the essence of the old
+    /// sampler sound"). Defaults to initialMachine's own top-end rate,
+    /// same as ParamSnapshot.defaults(for:) would give it.
+    @State private var sampleRateHz: Double = ParamSnapshot.defaults(for: Self.initialMachine).sampleRateHz
     @State private var processedChannels: [[Float]]?
 
     @State private var isLiveAuditionOn = false
@@ -124,6 +130,35 @@ struct ContentView: View {
     /// window doesn't re-decode a whole file's worth of PCM every frame.
     @State private var originalWaveformSamples: [Float] = []
     @State private var processedWaveformSamples: [Float]?
+
+    // -- waveform transport (2.1 feedback: "show playback bar over
+    // sample waveform... click and move start point with mouse") -------
+
+    /// Which of the app's independent audio sources is currently
+    /// playing, if any -- what _pollTransport reads playheadFraction
+    /// from. Distinct from isPlayingOffline/isLiveAuditionOn (which
+    /// exist for button-enabled state): this exists so the poll knows
+    /// WHICH controller's position to ask for.
+    private enum PlayingSource { case none, original, processed, live }
+    @State private var playingSource: PlayingSource = .none
+
+    /// [0, 1) fraction through the current source's playback, or nil
+    /// when nothing is playing -- polled from AudioPlaybackController/
+    /// LiveAuditionController by _pollTransport, same cadence as the
+    /// existing recomputing-busy-light poll.
+    @State private var playheadFraction: Double?
+
+    /// Frame index (into the ORIGINAL, untrimmed sample) playback and
+    /// rendering start from -- a transport position, not a param (see
+    /// ProcessedRender.render's own doc comment on why this never
+    /// touches AkzStretchParams/ParamSnapshot). Reset to 0 on every load;
+    /// dragged via the waveform's start-point marker.
+    @State private var startFrame: Int = 0
+
+    /// The startFrame the current processedChannels render actually used
+    /// -- extends _renderIsStale the same way renderedSnapshot does for
+    /// the ten DSP params.
+    @State private var renderedStartFrame: Int?
 
     private let audioFileService = AudioFileService()
     private let playback = AudioPlaybackController()
@@ -208,12 +243,23 @@ struct ContentView: View {
 
         // Bandwidth (v2 heritage-roster plan, stage 4/9) -- only on a
         // machine whose sample rate is genuinely a knob, not a fixed
-        // spec. sampleRateHz == 0 (the RateModel.h sentinel) reads as
-        // "fully open," matching the filter cutoff's own 0xffff/Nyquist
-        // convention, rather than showing a literal 0hz.
+        // spec. sampleRateHz is always a real, in-range value as of 2.1
+        // (never the old 0/bypass sentinel), so this is just the value
+        // -- plus a state word explaining WHY the top of the knob's
+        // travel can sound unprocessed: 2.1 feedback was that the
+        // control needed to be "more user friendly," and "the number
+        // changed but the sound didn't" is the actual illegibility, not
+        // a bug in the rate stage (you can't decimate a file UP to a
+        // rate above its own, so a machine oversampling the loaded file
+        // is a genuine, honest no-op -- see RateModel.cpp).
         if machineProfile.hasVariableSampleRate != 0 {
-            let displayHz = sampleRateHz > 0 ? sampleRateHz : machineProfile.maxSampleRateHz
-            rows.append([LCDField("rate", "\(Int(displayHz))hz")])
+            var rateText = "\(Int(sampleRateHz))hz"
+            if sampleRateHz >= machineProfile.maxSampleRateHz {
+                rateText += " · full"
+            } else if let loadedSample, sampleRateHz >= loadedSample.sampleRateHz {
+                rateText += " · at source rate"
+            }
+            rows.append([LCDField("rate", rateText)])
         }
 
         if _inferredStageCount > 0 {
@@ -361,7 +407,10 @@ struct ContentView: View {
             if let presetError {
                 statusMessage = presetError
             }
-            playback.onFinished = { isPlayingOffline = false }
+            playback.onFinished = {
+                isPlayingOffline = false
+                if playingSource == .original || playingSource == .processed { playingSource = .none }
+            }
             _autoloadIfRequested()
             _sweepDragExportTempFiles()
         }
@@ -578,9 +627,22 @@ struct ContentView: View {
             LCDReadoutView(rows: _lcdRows)
 
             if let sample = loadedSample {
-                WaveformView(samples: originalWaveformSamples, overlaySamples: processedWaveformSamples)
-                    .draggable(_dragExport(for: sample))
-                    .help("Drag out to export the processed audio as a .wav")
+                let referenceCount = max(originalWaveformSamples.count, processedWaveformSamples?.count ?? 0)
+                WaveformView(
+                    samples: originalWaveformSamples,
+                    overlaySamples: processedWaveformSamples,
+                    startFraction: referenceCount > 0 ? Double(startFrame) / Double(referenceCount) : 0,
+                    playheadFraction: _playheadSharedFraction,
+                    dragExport: _dragExport(for: sample),
+                    onScrubChanged: { fraction in
+                        startFrame = Int((fraction * Double(referenceCount)).rounded())
+                    },
+                    onScrubEnded: { fraction in
+                        startFrame = Int((fraction * Double(referenceCount)).rounded())
+                        _pushLiveSourceIfNeeded()
+                    }
+                )
+                .help("Click or drag to set the start point")
             }
 
             if let sample = loadedSample {
@@ -649,9 +711,9 @@ struct ContentView: View {
                     //
                     // Generated from MachineControls.controls(for:mode:)
                     // (v2 heritage-roster plan, stage 9) rather than a
-                    // hand-written chain of `if`s -- SP-1200 (Bandwidth +
-                    // Cutoff + Transpose, no stretch cluster at all) and
-                    // S950 (bandwidth AND stretch together) are
+                    // hand-written chain of `if`s -- SP-1200 (Cutoff +
+                    // Transpose only, no stretch or bandwidth cluster at
+                    // all) and S950 (bandwidth AND stretch together) are
                     // orthogonal axes that used to multiply combinations
                     // by hand; the descriptor table gets every
                     // combination right by construction instead.
@@ -747,7 +809,7 @@ struct ContentView: View {
                     .onChange(of: isLiveAuditionOn) { _, on in
                         if on { _startLiveAudition() } else { _stopLiveAudition() }
                     }
-                    .onReceive(_recomputingPollTimer) { _ in _pollRecomputing() }
+                    .onReceive(_recomputingPollTimer) { _ in _pollTransport() }
 
                     HStack {
                         Button("Process", action: process)
@@ -824,19 +886,15 @@ struct ContentView: View {
     }
 
     /// Double-click-to-reset target for one knob -- the current
-    /// machine's documented default, same principle as every other
-    /// knob's defaultValue. Bandwidth is a deliberate exception:
-    /// AkzStretchParams.sampleRateHz's own default is 0 ("no rate
-    /// stage" -- RateModel.h), which sits BELOW the knob's own
-    /// [minSampleRateHz, maxSampleRateHz] range and would look broken
-    /// as a reset target. maxSampleRateHz resets to the same audible
-    /// no-op behaviour (applyRecordPath's own effectiveRateHz >=
-    /// hostSampleRateHz early-out), just expressed as a value inside
-    /// the visible range instead of the sentinel.
+    /// machine's documented default, same principle for every knob
+    /// including bandwidth: as of 2.1, _defaultParams.sampleRateHz IS
+    /// the machine's own maxSampleRateHz (never the old 0 sentinel), so
+    /// this needs no special case any more -- resetting bandwidth always
+    /// lands back at "full."
     private func _defaultValue(for id: ParamID) -> Double? {
         switch id {
         case .transpose: return Double(_defaultParams.transposeSemitones)
-        case .bandwidth: return machineProfile.maxSampleRateHz
+        case .bandwidth: return Double(_defaultParams.sampleRateHz)
         case .cutoff: return Double(_defaultParams.filterCutoff01)
         case .resonance: return Double(_defaultParams.filterResonance01)
         case .stretch: return Double(_defaultParams.timeFactorPercent)
@@ -880,7 +938,9 @@ struct ContentView: View {
         // A running live session is bound to the previous file's channel
         // count and sample rate -- simplest and safest is to stop it
         // rather than try to reconcile those with whatever loads next.
-        // Offline playback is bound to the previous file's audio too.
+        // Offline playback (AudioPlaybackController) reconnects itself to
+        // a new file's format on the next play(), so stopping it here is
+        // just "don't keep the old file sounding".
         isLiveAuditionOn = false
         _stopLiveAudition()
         playback.stop()
@@ -894,6 +954,10 @@ struct ContentView: View {
             processedChannels = nil
             processedWaveformSamples = nil
             renderedSnapshot = nil
+            startFrame = 0 // file-specific -- a new file's start point is 0, never inherited
+            renderedStartFrame = nil
+            playingSource = .none
+            playheadFraction = nil
             _addToRecentFiles(url)
 
             let interleaved = PCMConversion.toFloat(sample.rawData, format: sample.format)
@@ -1066,7 +1130,42 @@ struct ContentView: View {
     /// Processed and to decide whether a drag-out export needs to
     /// re-render first.
     private var _renderIsStale: Bool {
-        processedChannels != nil && renderedSnapshot != _snapshot()
+        processedChannels != nil && (renderedSnapshot != _snapshot() || renderedStartFrame != startFrame)
+    }
+
+    /// Converts whichever source is actually playing's OWN [0, 1)
+    /// playheadFraction into the shared referenceCount-space fraction
+    /// WaveformView draws against (see its own doc comment on
+    /// startFraction/playheadFraction for why that space, not
+    /// samples.count, is the right one).
+    ///
+    /// - .original/.live played `_trimmedToStartFrame(original)`, i.e.
+    ///   original[startFrame...] -- so frame 0 of ITS OWN fraction is
+    ///   really originalWaveformSamples[startFrame], not [0]. Shared
+    ///   fraction = (startFrame + own fraction * trimmed length) /
+    ///   referenceCount.
+    /// - .processed played processedChannels, which was ALREADY
+    ///   rendered from a trimmed source (ProcessedRender.render's own
+    ///   startFrame) -- so its own fraction 0 really is the trimmed
+    ///   render's own frame 0, with no further startFrame offset to add.
+    ///   Shared fraction = own fraction * processedCount / referenceCount.
+    private var _playheadSharedFraction: Double? {
+        guard let playheadFraction else { return nil }
+        let referenceCount = max(originalWaveformSamples.count, processedWaveformSamples?.count ?? 0)
+        guard referenceCount > 0 else { return nil }
+
+        switch playingSource {
+        case .none:
+            return nil
+        case .original, .live:
+            let trimmedLength = max(0, originalWaveformSamples.count - startFrame)
+            guard trimmedLength > 0 else { return nil }
+            let framesIn = playheadFraction * Double(trimmedLength)
+            return (Double(startFrame) + framesIn) / Double(referenceCount)
+        case .processed:
+            guard let processedCount = processedWaveformSamples?.count, processedCount > 0 else { return nil }
+            return (playheadFraction * Double(processedCount)) / Double(referenceCount)
+        }
     }
 
     // -- undo/redo (params only) ---------------------------------------------
@@ -1187,7 +1286,16 @@ struct ContentView: View {
         transposeSemitones = s.transposeSemitones
         filterCutoff = s.filterCutoff
         filterResonance = s.filterResonance
-        sampleRateHz = s.sampleRateHz
+        // Clamped into s.machine's own range rather than assigned
+        // directly: machine(forStableId:) falls back to S950 for an
+        // unrecognised id (a preset saved by a future build naming a
+        // machine this one doesn't have), which could otherwise land a
+        // rate from that machine's range onto a different machine's
+        // knob. The DSP clamps regardless (RateModel.cpp), but the LCD/
+        // knob display staying honest is the whole point of 2.1's
+        // bandwidth legibility fix.
+        let profile = StretchProcessor.profile(for: s.machine)
+        sampleRateHz = min(max(s.sampleRateHz, profile.minSampleRateHz), profile.maxSampleRateHz)
         _pushLiveParamsIfNeeded()
     }
 
@@ -1252,12 +1360,19 @@ struct ContentView: View {
         processedChannels = nil
         processedWaveformSamples = nil
         renderedSnapshot = nil
+        renderedStartFrame = nil
         statusMessage = "Reverted to \(machineProfile.displayName) defaults."
     }
 
-    // -- recomputing busy light ---------------------------------------------
+    // -- recomputing busy light + waveform transport poll --------------------
 
-    private func _pollRecomputing() {
+    /// Was _pollRecomputing -- renamed once it started polling the
+    /// playhead too (2.1 feedback: "show playback bar over sample
+    /// waveform"). One 20Hz main-thread poll shared by both, same
+    /// pattern as the busy-light poll already used (a C++ atomic /
+    /// AVAudioPlayerNode's own render-time bookkeeping, neither of which
+    /// has anything to subscribe to).
+    private func _pollTransport() {
         let now = Date()
         let raw = liveController?.isRecomputing ?? false
 
@@ -1274,6 +1389,15 @@ struct ContentView: View {
                 _recomputingVisibleUntil = nil
             }
         }
+
+        switch playingSource {
+        case .none:
+            playheadFraction = nil
+        case .original, .processed:
+            playheadFraction = playback.playheadFraction
+        case .live:
+            playheadFraction = liveController?.playheadFraction
+        }
     }
 
     /// Stops whichever of the two independent audio engines
@@ -1285,6 +1409,7 @@ struct ContentView: View {
         playback.stop()
         isPlayingOffline = false
         isLiveAuditionOn = false // onChange(of: isLiveAuditionOn) below calls _stopLiveAudition()
+        playingSource = .none
     }
 
     private func _startLiveAudition() {
@@ -1296,7 +1421,7 @@ struct ContentView: View {
         playback.stop()
         isPlayingOffline = false
         let interleaved = PCMConversion.toFloat(sample.rawData, format: sample.format)
-        let channels = PCMConversion.deinterleave(interleaved, channelCount: sample.channelCount)
+        let channels = _trimmedToStartFrame(PCMConversion.deinterleave(interleaved, channelCount: sample.channelCount))
 
         let controller = LiveAuditionController(channelCount: sample.channelCount, sampleRateHz: sample.sampleRateHz)
         controller.setSource(channels: channels)
@@ -1304,6 +1429,7 @@ struct ContentView: View {
         do {
             try controller.start()
             liveController = controller
+            playingSource = .live
             statusMessage = "Live audition running -- drag Stretch/Cycle to hear changes."
         } catch {
             statusMessage = "Live audition failed to start: \(error)"
@@ -1314,6 +1440,7 @@ struct ContentView: View {
     private func _stopLiveAudition() {
         liveController?.stop()
         liveController = nil
+        if playingSource == .live { playingSource = .none }
     }
 
     /// Called from every param-affecting onChange handler. A no-op
@@ -1324,26 +1451,55 @@ struct ContentView: View {
         controller.setParams(_currentParams())
     }
 
+    /// Sibling of _pushLiveParamsIfNeeded, for the start point (2.1).
+    /// Called on SCRUB END, not every drag frame: setSource() kicks a
+    /// full background recompute on every channel and resets the
+    /// realtime read position, so firing it per drag frame would thrash
+    /// the worker threads for no audible benefit -- the marker follows
+    /// the cursor live regardless (WaveformView draws it from
+    /// `startFrame` directly), and the audio catches up once the drag
+    /// ends. Matches AkaizerCore.h's documented "audition is not
+    /// expected to be phase-continuous across a change."
+    private func _pushLiveSourceIfNeeded() {
+        guard isLiveAuditionOn, let controller = liveController, let sample = loadedSample else { return }
+        let interleaved = PCMConversion.toFloat(sample.rawData, format: sample.format)
+        let channels = _trimmedToStartFrame(PCMConversion.deinterleave(interleaved, channelCount: sample.channelCount))
+        controller.setSource(channels: channels)
+    }
+
     private func process() {
         guard let sample = loadedSample else { return }
 
         let snapshot = _snapshot()
-        let outputChannels = ProcessedRender.render(sample: sample, params: snapshot.params)
+        let outputChannels = ProcessedRender.render(sample: sample, params: snapshot.params, startFrame: startFrame)
 
         processedChannels = outputChannels
         processedWaveformSamples = outputChannels.first
         renderedSnapshot = snapshot
+        renderedStartFrame = startFrame
         let outFrames = outputChannels.first?.count ?? 0
         statusMessage = "Processed: \(sample.frameCount) → \(outFrames) frames (\(String(format: "%.2f", Double(outFrames) / sample.sampleRateHz))s)."
+    }
+
+    /// Slices `channels` (full-length, one array per channel) at
+    /// startFrame -- the one place every playback/live-audition path
+    /// trims to the current start point. Clamped, not trusted: past the
+    /// end clamps to empty per channel rather than crashing.
+    private func _trimmedToStartFrame(_ channels: [[Float]]) -> [[Float]] {
+        channels.map { channel in
+            let clamped = min(max(0, startFrame), channel.count)
+            return Array(channel[clamped...])
+        }
     }
 
     private func playOriginal() {
         guard let sample = loadedSample else { return }
         let interleaved = PCMConversion.toFloat(sample.rawData, format: sample.format)
-        let channels = PCMConversion.deinterleave(interleaved, channelCount: sample.channelCount)
+        let channels = _trimmedToStartFrame(PCMConversion.deinterleave(interleaved, channelCount: sample.channelCount))
         do {
             try playback.play(channels: channels, sampleRateHz: sample.sampleRateHz)
             isPlayingOffline = true
+            playingSource = .original
         } catch {
             statusMessage = "Playback failed: \(error)"
         }
@@ -1356,8 +1512,13 @@ struct ContentView: View {
         // render to the ORIGINAL's RMS, so a level difference between
         // the two never gets mistaken for the stretch effect itself.
         // Play Original is the reference and always plays unscaled.
+        // Trimmed to the SAME start point processedChannels was
+        // rendered from (2.1), so the loudness reference stays honest --
+        // `channels` itself is NOT trimmed again here: it's already the
+        // trimmed render (see ProcessedRender.render's startFrame), and
+        // double-trimming it would cut the start point twice over.
         let originalInterleaved = PCMConversion.toFloat(sample.rawData, format: sample.format)
-        let originalChannels = PCMConversion.deinterleave(originalInterleaved, channelCount: sample.channelCount)
+        let originalChannels = _trimmedToStartFrame(PCMConversion.deinterleave(originalInterleaved, channelCount: sample.channelCount))
         let referenceRMS = PCMConversion.rms(originalChannels)
         let gain = PCMConversion.matchedGain(channels, toMatchRMS: referenceRMS)
         let matchedChannels = PCMConversion.applyGain(channels, gain: gain)
@@ -1365,6 +1526,7 @@ struct ContentView: View {
         do {
             try playback.play(channels: matchedChannels, sampleRateHz: sample.sampleRateHz)
             isPlayingOffline = true
+            playingSource = .processed
         } catch {
             statusMessage = "Playback failed: \(error)"
         }
@@ -1396,13 +1558,15 @@ struct ContentView: View {
         guard let sample = loadedSample else { return }
         let snapshot = _snapshot()
         let params = snapshot.params
+        let capturedStartFrame = startFrame
         Task {
             let channels = await Task.detached(priority: .userInitiated) {
-                ProcessedRender.render(sample: sample, params: params)
+                ProcessedRender.render(sample: sample, params: params, startFrame: capturedStartFrame)
             }.value
             processedChannels = channels
             processedWaveformSamples = channels.first
             renderedSnapshot = snapshot
+            renderedStartFrame = capturedStartFrame
             saveProcessed()
         }
     }
@@ -1413,10 +1577,12 @@ struct ContentView: View {
     /// than doing any rendering here, so this can be called fresh on
     /// every body evaluation without cost.
     private func _dragExport(for sample: LoadedSample) -> ProcessedWavExport {
-        ProcessedWavExport(
+        let capturedStartFrame = startFrame
+        return ProcessedWavExport(
             source: sample,
             snapshot: _snapshot(),
             cachedChannels: _renderIsStale ? nil : processedChannels,
+            startFrame: capturedStartFrame,
             fileName: sample.url.deletingPathExtension().lastPathComponent + "-stretched.wav",
             onRendered: { channels, snapshot in
                 // ProcessedWavExport invokes this via `await
@@ -1429,6 +1595,7 @@ struct ContentView: View {
                     processedChannels = channels
                     processedWaveformSamples = channels.first
                     renderedSnapshot = snapshot
+                    renderedStartFrame = capturedStartFrame
                 }
             }
         )

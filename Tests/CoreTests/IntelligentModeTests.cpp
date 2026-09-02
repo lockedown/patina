@@ -272,6 +272,142 @@ AKZ_TEST(quality_search_actually_changes_which_material_gets_spliced_in) {
     AKZ_CHECK(anyDifference);
 }
 
+// -- 2.1 stereo splice linkage ------------------------------------------
+//
+// "Still splitting channels and phasing when in realtime edit mode" --
+// each channel's own StretchEngine picks its SOLA splice offset by
+// cross-correlating ITS OWN content, so two different channels (L/R of
+// one stereo file) can and do choose different offsets at the same
+// nominal position: stereo decorrelation. setSpliceGuide is what a
+// coordinator (ProcessedRender.swift / LiveAuditionController.swift)
+// uses to force every channel's engine to splice at the SAME positions
+// instead, derived from one shared (typically mid/summed) analysis pass.
+
+AKZ_TEST(without_a_guide_two_different_signals_choose_different_splice_offsets) {
+    // Establishes the bug this fixes, not just the fix: two genuinely
+    // different signals, same length/params, independently searching
+    // their own content, land on different offsets somewhere in a long
+    // enough render. If this ever stopped being true the regression test
+    // below would be vacuous.
+    auto signalA = makeSine(20000, 220.0, 44100.0);
+    auto signalB = makeSine(20000, 830.0, 44100.0);
+    AkzStretchParams params = makeIntelligentParams(AkzMachine_S1000, 150.0f, 60, 50);
+
+    AkzStretchEngine* engineA = akz_stretch_engine_create(44100.0);
+    akz_stretch_engine_set_params(engineA, &params);
+    akz_stretch_engine_set_source(engineA, signalA.data(), signalA.size());
+    std::vector<float> outA(akz_stretch_engine_output_length(engineA));
+    akz_stretch_engine_process(engineA, outA.data(), outA.size());
+
+    AkzStretchEngine* engineB = akz_stretch_engine_create(44100.0);
+    akz_stretch_engine_set_params(engineB, &params);
+    akz_stretch_engine_set_source(engineB, signalB.data(), signalB.size());
+    std::vector<float> outB(akz_stretch_engine_output_length(engineB));
+    akz_stretch_engine_process(engineB, outB.data(), outB.size());
+
+    size_t countA = akz_stretch_engine_last_splice_offset_count(engineA);
+    size_t countB = akz_stretch_engine_last_splice_offset_count(engineB);
+    AKZ_CHECK(countA > 0);
+    AKZ_CHECK_EQ(countA, countB); // purely length/params-derived -- see _planIntelligent
+
+    std::vector<long long> offsetsA(countA), offsetsB(countB);
+    akz_stretch_engine_get_last_splice_offsets(engineA, offsetsA.data(), countA);
+    akz_stretch_engine_get_last_splice_offsets(engineB, offsetsB.data(), countB);
+
+    bool anyOffsetDiffers = false;
+    for (size_t i = 0; i < countA; ++i) {
+        if (offsetsA[i] != offsetsB[i]) { anyOffsetDiffers = true; break; }
+    }
+    AKZ_CHECK(anyOffsetDiffers);
+
+    akz_stretch_engine_destroy(engineA);
+    akz_stretch_engine_destroy(engineB);
+}
+
+AKZ_TEST(same_guide_makes_two_different_signals_choose_identical_splice_offsets) {
+    // The actual fix, direct: same two signals as above, but both given
+    // the SAME guide (here, derived from A's own unguided search --
+    // standing in for a real mid/summed analysis pass, which is exactly
+    // as "not this engine's own content" from B's point of view).
+    auto signalA = makeSine(20000, 220.0, 44100.0);
+    auto signalB = makeSine(20000, 830.0, 44100.0);
+    AkzStretchParams params = makeIntelligentParams(AkzMachine_S1000, 150.0f, 60, 50);
+
+    AkzStretchEngine* guideSource = akz_stretch_engine_create(44100.0);
+    akz_stretch_engine_set_params(guideSource, &params);
+    akz_stretch_engine_set_source(guideSource, signalA.data(), signalA.size());
+    std::vector<float> guideRender(akz_stretch_engine_output_length(guideSource));
+    akz_stretch_engine_process(guideSource, guideRender.data(), guideRender.size());
+    size_t guideCount = akz_stretch_engine_last_splice_offset_count(guideSource);
+    AKZ_CHECK(guideCount > 0);
+    std::vector<long long> guide(guideCount);
+    akz_stretch_engine_get_last_splice_offsets(guideSource, guide.data(), guideCount);
+    akz_stretch_engine_destroy(guideSource);
+
+    auto renderGuided = [&](const std::vector<float>& signal) {
+        AkzStretchEngine* engine = akz_stretch_engine_create(44100.0);
+        akz_stretch_engine_set_splice_guide(engine, guide.data(), guide.size());
+        akz_stretch_engine_set_params(engine, &params);
+        akz_stretch_engine_set_source(engine, signal.data(), signal.size());
+        std::vector<float> out(akz_stretch_engine_output_length(engine));
+        akz_stretch_engine_process(engine, out.data(), out.size());
+        size_t count = akz_stretch_engine_last_splice_offset_count(engine);
+        std::vector<long long> usedOffsets(count);
+        akz_stretch_engine_get_last_splice_offsets(engine, usedOffsets.data(), count);
+        akz_stretch_engine_destroy(engine);
+        return usedOffsets;
+    };
+
+    auto usedByA = renderGuided(signalA);
+    auto usedByB = renderGuided(signalB);
+
+    // Both channels used the guide verbatim, not their own search --
+    // identical to each other AND identical to the guide itself.
+    AKZ_CHECK_EQ(usedByA.size(), guide.size());
+    AKZ_CHECK_EQ(usedByB.size(), guide.size());
+    for (size_t i = 0; i < guide.size(); ++i) {
+        AKZ_CHECK_EQ(usedByA[i], guide[i]);
+        AKZ_CHECK_EQ(usedByB[i], guide[i]);
+    }
+}
+
+AKZ_TEST(clearing_the_guide_reverts_to_independent_search) {
+    auto signal = makeSine(20000, 220.0, 44100.0);
+    AkzStretchParams params = makeIntelligentParams(AkzMachine_S1000, 150.0f, 60, 50);
+
+    AkzStretchEngine* engine = akz_stretch_engine_create(44100.0);
+    // An all-zero guide is trivially distinguishable from a real search's
+    // offsets on this signal/params combination (verified below).
+    std::vector<long long> zeroGuide(64, 0);
+    akz_stretch_engine_set_splice_guide(engine, zeroGuide.data(), zeroGuide.size());
+    akz_stretch_engine_set_params(engine, &params);
+    akz_stretch_engine_set_source(engine, signal.data(), signal.size());
+    std::vector<float> guidedOut(akz_stretch_engine_output_length(engine));
+    akz_stretch_engine_process(engine, guidedOut.data(), guidedOut.size());
+    size_t guidedCount = akz_stretch_engine_last_splice_offset_count(engine);
+    std::vector<long long> guidedOffsets(guidedCount);
+    akz_stretch_engine_get_last_splice_offsets(engine, guidedOffsets.data(), guidedCount);
+
+    akz_stretch_engine_clear_splice_guide(engine);
+    akz_stretch_engine_reset(engine); // force a genuinely fresh recompute, not the cheap filter-only path
+    akz_stretch_engine_set_params(engine, &params);
+    akz_stretch_engine_set_source(engine, signal.data(), signal.size());
+    std::vector<float> searchedOut(akz_stretch_engine_output_length(engine));
+    akz_stretch_engine_process(engine, searchedOut.data(), searchedOut.size());
+    size_t searchedCount = akz_stretch_engine_last_splice_offset_count(engine);
+    std::vector<long long> searchedOffsets(searchedCount);
+    akz_stretch_engine_get_last_splice_offsets(engine, searchedOffsets.data(), searchedCount);
+
+    AKZ_CHECK_EQ(guidedCount, searchedCount);
+    bool anyOffsetDiffers = false;
+    for (size_t i = 0; i < guidedCount && i < zeroGuide.size(); ++i) {
+        if (guidedOffsets[i] != searchedOffsets[i]) { anyOffsetDiffers = true; break; }
+    }
+    AKZ_CHECK(anyOffsetDiffers);
+
+    akz_stretch_engine_destroy(engine);
+}
+
 AKZ_TEST(intelligent_handles_source_shorter_than_one_frame) {
     // Falls back to a plain resample (see _planIntelligent's useFallback
     // branch) rather than crashing or producing garbage when there isn't

@@ -43,15 +43,20 @@ namespace akz {
 
 // Resolves AkzStretchParams.sampleRateHz into an actual rate to run the
 // record path at. 0 (or any non-positive value) resolves to
-// hostSampleRateHz itself -- "no rate stage" -- which is what every
-// existing preset and every machine default decodes to today (see
-// PresetStore.swift's decodeIfPresent), so this field is a true no-op
-// until something explicitly sets it. A positive value is clamped into
-// [profile.minSampleRateHz, profile.maxSampleRateHz] so a caller never
-// has to already know the machine's own range, and a fixed/dual-rate
-// machine (hasVariableSampleRate == 0) collapses any request outside
-// its two real rates to the nearer bound automatically, since clamping
-// into [min, max] does that by construction.
+// profile.maxSampleRateHz -- the machine's own top-end rate -- per
+// AkaizerCore.h's field doc. 2.1 feedback: the rate stage must never be
+// bypassed, "as this is the essence of the old sampler sound"; before
+// this, <= 0 resolved to hostSampleRateHz (a true bypass), and every
+// machine's own default was 0 (StretchEngine.cpp's
+// akz_stretch_params_default), so every machine shipped bypassed,
+// including fixed-rate ones (SP-1200, Emulator II) whose one rate IS
+// their defining character. There is no bypass value left: this function
+// always resolves to a real, in-range rate. A positive value is clamped
+// into [profile.minSampleRateHz, profile.maxSampleRateHz] so a caller
+// never has to already know the machine's own range, and a fixed/dual-
+// rate machine (hasVariableSampleRate == 0) collapses any request
+// outside its two real rates to the nearer bound automatically, since
+// clamping into [min, max] does that by construction.
 double resolveSampleRateHz(AkzMachine machine, float requestedSampleRateHz, double hostSampleRateHz);
 
 // Applies the record path to `buffer` in place: anti-alias filter (only

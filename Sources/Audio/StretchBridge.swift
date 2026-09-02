@@ -41,6 +41,29 @@ public final class StretchProcessor {
         Int(akz_stretch_engine_output_length(engine))
     }
 
+    /// 2.1 stereo splice linkage -- see StretchEngine.h's setSpliceGuide
+    /// doc comment. Forces INTELLIGENT mode's SOLA search to use these
+    /// offsets verbatim instead of cross-correlating this engine's own
+    /// source, so every channel given the same guide splices identically.
+    public func setSpliceGuide(_ offsets: [Int64]) {
+        akz_stretch_engine_set_splice_guide(engine, offsets, offsets.count)
+    }
+
+    /// The splice offsets the last INTELLIGENT-mode render actually used
+    /// (own search, or a guide) -- what a "guide pass" render (over a
+    /// mid/summed signal, no guide of its own) hands to every real
+    /// channel's setSpliceGuide(_:). Empty outside INTELLIGENT mode or
+    /// before any render.
+    public var lastSpliceOffsets: [Int64] {
+        let count = akz_stretch_engine_last_splice_offset_count(engine)
+        guard count > 0 else { return [] }
+        var offsets = [Int64](repeating: 0, count: count)
+        offsets.withUnsafeMutableBufferPointer { buf in
+            _ = akz_stretch_engine_get_last_splice_offsets(engine, buf.baseAddress, count)
+        }
+        return offsets
+    }
+
     /// Renders the entire output in one call -- fine for the offline
     /// milestone this is currently used for. See StretchEngine.h's
     /// stage-4 TODO for why this isn't yet how real-time audition will
@@ -165,6 +188,13 @@ public final class RealtimePlayer {
         akz_realtime_player_is_ready(player) != 0
     }
 
+    /// Render-thread safe, non-blocking. 2.1 feedback ("show playback
+    /// bar over sample waveform"): normalised [0, 1) read position into
+    /// the currently published buffer -- 0 before the first publish.
+    public var readPosition01: Double {
+        akz_realtime_player_read_position01(player)
+    }
+
     /// Render-thread safe, non-blocking. See AkaizerCore.h's comment on
     /// akz_realtime_player_has_pending_commit -- true once a
     /// stretch-affecting re-render is waiting to be swapped in. Must be
@@ -185,6 +215,15 @@ public final class RealtimePlayer {
     /// "recomputing" UI indicator.
     public var isRecomputing: Bool {
         akz_realtime_player_is_recomputing(player) != 0
+    }
+
+    /// Main-thread only. 2.1 stereo splice linkage -- see
+    /// StretchProcessor.setSpliceGuide's doc comment; this is the same
+    /// thing threaded through to this player's background worker.
+    /// Persists across subsequent re-renders until a later call replaces
+    /// it -- does not need to be resent unless it actually changes.
+    public func setSpliceGuide(_ offsets: [Int64]) {
+        akz_realtime_player_set_splice_guide(player, offsets, offsets.count)
     }
 }
 

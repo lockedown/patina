@@ -70,10 +70,12 @@ public struct AkaizerPreset: Codable, Identifiable, Equatable {
     private var transposeSemitones: Float
     private var filterCutoff01: Float
     private var filterResonance01: Float
-    /// 0 = machine default. Added in the same v2 format as machineId,
-    /// but decoded with decodeIfPresent below regardless -- demonstrating
-    /// the whole point of the hand-written Codable: this is additive,
-    /// not a reason to bump formatVersion again.
+    /// Always a real, in-range rate as of 2.1 -- see init(from:)'s
+    /// migration for how an older file's absent-or-zero value becomes
+    /// one. Added in the same v2 format as machineId, but decoded with
+    /// decodeIfPresent below regardless -- demonstrating the whole point
+    /// of the hand-written Codable: this is additive, not a reason to
+    /// bump formatVersion again.
     private var sampleRateHz: Float
 
     public init(name: String, params: AkzStretchParams) {
@@ -131,7 +133,22 @@ public struct AkaizerPreset: Codable, Identifiable, Equatable {
         transposeSemitones = try c.decode(Float.self, forKey: .transposeSemitones)
         filterCutoff01 = try c.decode(Float.self, forKey: .filterCutoff01)
         filterResonance01 = try c.decode(Float.self, forKey: .filterResonance01)
-        sampleRateHz = try c.decodeIfPresent(Float.self, forKey: .sampleRateHz) ?? 0
+        // 2.1 migration: a literal 0 here means either "absent" (any
+        // preset saved before the bandwidth knob existed) or a stored
+        // sentinel from when 0 meant "bypass the rate stage entirely" --
+        // neither is possible to produce from the UI any more (every
+        // write path clamps into the knob's range), and both must land
+        // on the SAME place a fresh default now does: the machine's own
+        // top-end rate, never a bypass. machineId is already resolved
+        // above, so the migrated machine's own profile is what "its max"
+        // means, not some other machine's.
+        let decodedSampleRateHz = try c.decodeIfPresent(Float.self, forKey: .sampleRateHz) ?? 0
+        if decodedSampleRateHz > 0 {
+            sampleRateHz = decodedSampleRateHz
+        } else {
+            let migratedMachine = StretchProcessor.machine(forStableId: machineId)
+            sampleRateHz = Float(StretchProcessor.profile(for: migratedMachine).maxSampleRateHz)
+        }
     }
 
     /// Always writes the current format -- a v1 file loaded and re-saved

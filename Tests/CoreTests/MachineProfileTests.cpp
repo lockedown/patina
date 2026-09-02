@@ -268,3 +268,19 @@ AKZ_TEST(default_params_are_no_op_and_machine_specific) {
     akz_stretch_params_default(AkzMachine_S2000, &params);
     AKZ_CHECK_EQ(params.cycleLengthSamples, 1340);          // S2000 CYC LENGTH default
 }
+
+AKZ_TEST(every_machines_default_sample_rate_is_its_own_max_never_zero) {
+    // 2.1 feedback: bandwidth must "never be 0 or bypassed." Roster-wide
+    // guard: every machine's default sampleRateHz equals its OWN
+    // maxSampleRateHz (never the old 0 sentinel), so the rate stage is
+    // engaged out of the box for every machine, including the fixed-rate
+    // ones whose single rate is their whole defining character.
+    for (int i = 0; i < AkzMachine_Count; ++i) {
+        const AkzMachine machine = static_cast<AkzMachine>(i);
+        const AkzMachineProfile* profile = akz_machine_profile(machine);
+        AkzStretchParams params;
+        akz_stretch_params_default(machine, &params);
+        AKZ_CHECK(params.sampleRateHz > 0.0f);
+        AKZ_CHECK_NEAR(params.sampleRateHz, profile->maxSampleRateHz, 0.001);
+    }
+}

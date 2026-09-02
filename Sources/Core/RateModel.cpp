@@ -90,10 +90,11 @@ ConverterSpec converterSpecForMachine(const AkzMachineProfile& profile) {
 } // namespace
 
 double resolveSampleRateHz(AkzMachine machine, float requestedSampleRateHz, double hostSampleRateHz) {
-    if (requestedSampleRateHz <= 0.0f) {
-        return hostSampleRateHz; // "no rate stage" -- see header comment
-    }
+    (void)hostSampleRateHz; // no longer a resolution target -- see header comment
     const AkzMachineProfile& profile = machineProfile(machine);
+    if (requestedSampleRateHz <= 0.0f) {
+        return profile.maxSampleRateHz; // machine's own top-end rate -- never a bypass
+    }
     const double requested = static_cast<double>(requestedSampleRateHz);
     return std::max(profile.minSampleRateHz, std::min(requested, profile.maxSampleRateHz));
 }

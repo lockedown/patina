@@ -329,6 +329,38 @@ size_t akz_stretch_engine_process(AkzStretchEngine* engine, float* out_frames, s
 // round(n_in * factor) exactly.
 size_t akz_stretch_engine_output_length(const AkzStretchEngine* engine);
 
+// 2.1 stereo splice linkage ("Still splitting channels and phasing in
+// realtime edit mode" — see StretchEngine.h's setSpliceGuide doc
+// comment): INTELLIGENT mode's SOLA splice search normally picks its
+// offset by cross-correlating THIS engine's own source, which -- run
+// independently per channel, as every caller does -- lets L and R drift
+// apart. Setting a guide makes every iteration use offsets[i] verbatim
+// instead of searching; giving every channel engine the SAME guide
+// (typically from a mid/summed analysis pass) keeps their splices
+// identical. Marks the engine dirty. offset_count may be shorter than
+// this render's own iteration count -- iterations past the guide's end
+// fall back to their own independent search rather than reading out of
+// bounds.
+void akz_stretch_engine_set_splice_guide(AkzStretchEngine* engine, const long long* offsets, size_t offset_count);
+
+// Clears a previously set guide -- iterations go back to searching
+// their own content. Marks the engine dirty.
+void akz_stretch_engine_clear_splice_guide(AkzStretchEngine* engine);
+
+// The number of splice offsets the last INTELLIGENT-mode render actually
+// used (whether from its own search or a guide) -- call this first to
+// size the buffer passed to akz_stretch_engine_get_last_splice_offsets.
+// Zero outside INTELLIGENT mode or before any render.
+size_t akz_stretch_engine_last_splice_offset_count(const AkzStretchEngine* engine);
+
+// Copies up to max_count of the last render's splice offsets into
+// out_offsets. Returns the number actually written (min of the real
+// count and max_count) -- this IS the guide to hand every other
+// channel's engine via akz_stretch_engine_set_splice_guide, when this
+// engine was run over a mid/summed "guide pass" signal with no guide of
+// its own.
+size_t akz_stretch_engine_get_last_splice_offsets(const AkzStretchEngine* engine, long long* out_offsets, size_t max_count);
+
 // ---------------------------------------------------------------------------
 // Real-time audition player — build order stage 4
 // ---------------------------------------------------------------------------
@@ -372,6 +404,14 @@ void akz_realtime_player_set_source(AkzRealtimePlayer* player, const float* sour
 // recompute with new params; does not block waiting for it to finish.
 void akz_realtime_player_set_params(AkzRealtimePlayer* player, const AkzStretchParams* params);
 
+// Main/UI-thread only. 2.1 stereo splice linkage -- see
+// akz_stretch_engine_set_splice_guide's doc comment above; this is the
+// same thing threaded through to the background worker. Persists across
+// subsequent re-renders (does not need to be resent unless it changes)
+// and, like set_source/set_params, requests a background recompute
+// rather than blocking for one.
+void akz_realtime_player_set_splice_guide(AkzRealtimePlayer* player, const long long* offsets, size_t offset_count);
+
 // Render-thread safe: never allocates, never blocks on the background
 // worker. Always fills exactly max_out_frames -- with looped audio once
 // a render has published, with silence before the first one has.
@@ -380,6 +420,13 @@ size_t akz_realtime_player_pull(AkzRealtimePlayer* player, float* out_frames, si
 // Render-thread safe, non-blocking. Non-zero once at least one render has
 // published (pull() will produce real audio rather than silence).
 int akz_realtime_player_is_ready(const AkzRealtimePlayer* player);
+
+// Render-thread safe, non-blocking. 2.1 feedback ("show playback bar
+// over sample waveform"): normalised [0, 1) read position into the
+// currently published buffer, for a live-audition playhead -- 0.0
+// before the first publish. set_source/set_params/commit_pending all
+// reset the underlying position to 0.
+double akz_realtime_player_read_position01(const AkzRealtimePlayer* player);
 
 // Render-thread safe, non-blocking. Non-zero once a stretch-affecting
 // re-render (Transpose/Stretch/Cycle/Quality/Width/Mode -- anything that

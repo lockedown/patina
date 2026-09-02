@@ -28,16 +28,18 @@ public struct ParamSnapshot: Equatable {
     public var transposeSemitones: Double
     public var filterCutoff: Double
     public var filterResonance: Double
-    /// 0 = machine default -- see AkzStretchParams.sampleRateHz. No UI
-    /// control sets this yet (heritage-roster plan stage 4/9 add the
-    /// bandwidth knob); wired through now so that landing is additive.
+    /// The bandwidth knob's rate, in Hz -- always a real, in-range value
+    /// (2.1: never 0/bypass, see AkzStretchParams.sampleRateHz and
+    /// RateModel.h). No default argument on purpose: every call site
+    /// naming an explicit value is what stops a future accidental
+    /// sentinel from compiling.
     public var sampleRateHz: Double
 
     public init(
         machine: AkzMachine, engine: AkzEngine, mode: AkzStretchMode,
         stretchPercent: Double, cycleLength: Double, quality: Double, width: Double,
         transposeSemitones: Double, filterCutoff: Double, filterResonance: Double,
-        sampleRateHz: Double = 0
+        sampleRateHz: Double
     ) {
         self.machine = machine
         self.engine = engine
