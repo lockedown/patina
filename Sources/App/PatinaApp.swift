@@ -20,7 +20,23 @@ import SwiftUI
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
+        // 2.3 feedback: "app doesn't start in the foreground" -- calling
+        // activate() synchronously, right here, was too early: this fires
+        // before the WindowGroup's window has actually been created and
+        // registered with the window server, so there was nothing yet
+        // for activate to usefully raise. Deferring one run-loop tick
+        // (so the window exists first) plus a second call from
+        // applicationDidBecomeActive as a backstop is the standard fix
+        // for this exact "launched, but some other app kept focus"
+        // symptom on a fresh (non-restored) launch.
+        DispatchQueue.main.async {
+            NSApp.activate(ignoringOtherApps: true)
+            NSApp.windows.first?.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        NSApp.windows.first?.makeKeyAndOrderFront(nil)
     }
 }
 

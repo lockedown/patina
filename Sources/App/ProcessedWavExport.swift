@@ -35,6 +35,28 @@ import CoreTransferable
 import Foundation
 import UniformTypeIdentifiers
 
+extension UTType {
+    /// Stamped on every drag-out export alongside the real .wav payload,
+    /// purely so ContentView's `_handleDrop` can recognise "this drag
+    /// originated from this app's own waveform export" and reject it
+    /// outright, before ever calling `loadFileRepresentation` on it.
+    ///
+    /// 2.3 made the WHOLE waveform surface `.draggable()` again (was a
+    /// small corner grip in 2.1/2.2) -- which made an accidental
+    /// self-drop (drag starts on the waveform, mouse releases somewhere
+    /// else in the same window, which has a window-wide `.onDrop`) much
+    /// easier to trigger than a tiny icon ever was. Observed live:
+    /// self-dropping hung the app on the next Quit/close (eventually
+    /// recovered). The likely mechanism -- `_materialize()`'s `await
+    /// MainActor.run` and file write racing AppKit's own interactive-
+    /// drag tracking run loop, on the SAME process, for a drop target
+    /// that IS the drag source -- isn't the kind of thing to chase with
+    /// a timing fix; not accepting the drop at all removes the whole
+    /// class of self-referential drag/drop reentrancy, not just this one
+    /// symptom of it.
+    static let patinaOwnDragExport = UTType(exportedAs: "com.davelocke.patina.own-drag-export")
+}
+
 struct ProcessedWavExport: Transferable {
     let source: LoadedSample
     let snapshot: ParamSnapshot
@@ -56,6 +78,11 @@ struct ProcessedWavExport: Transferable {
         FileRepresentation(exportedContentType: .wav) { item in
             SentTransferredFile(try await item._materialize())
         }
+        // Cheap, never actually materialized on a self-drop -- see
+        // UTType.patinaOwnDragExport's comment above. `_handleDrop`
+        // checks for this type identifier's mere PRESENCE and bails out
+        // before touching the .wav representation at all.
+        DataRepresentation(exportedContentType: .patinaOwnDragExport) { _ in Data() }
     }
 
     private func _materialize() async throws -> URL {
