@@ -646,15 +646,12 @@ struct ContentView: View {
                     startFraction: referenceCount > 0 ? Double(startFrame) / Double(referenceCount) : 0,
                     playheadFraction: _playheadSharedFraction,
                     dragExport: _dragExport(for: sample),
-                    onScrubChanged: { fraction in
-                        startFrame = Int((fraction * Double(referenceCount)).rounded())
-                    },
                     onScrubEnded: { fraction in
                         startFrame = Int((fraction * Double(referenceCount)).rounded())
                         _pushLiveSourceIfNeeded()
                     }
                 )
-                .help("Click or drag to set the start point")
+                .help("Click and drag to export the processed audio · ⇧-click to set the start point")
             }
 
             if let sample = loadedSample {
@@ -849,6 +846,14 @@ struct ContentView: View {
                             .keyboardShortcut(".", modifiers: .command)
                         Button(_renderIsStale ? "Save Processed… (stale)" : "Save Processed…", action: saveProcessed)
                             .disabled(processedChannels == nil)
+                        // 2.3 feedback: chain repeated stretches/filters
+                        // the way the real hardware's own re-sampling
+                        // workflow did (stretch, then stretch the result
+                        // again). In-memory only -- Save Processed above
+                        // is the path to keep a generation on disk.
+                        Button("Use as Source", action: _useProcessedAsSource)
+                            .disabled(processedChannels == nil)
+                            .help("Make the processed render the new source, in place -- chain another pass of stretch/filter on top of it.")
                         // v2 heritage-roster plan, stage 11: closes the
                         // README's "no 'save what I'm hearing right
                         // now' path" gap. Save Processed above saves the
@@ -953,37 +958,77 @@ struct ContentView: View {
     /// Loads a file by URL, whether from the Open panel or the
     /// AKAIZER_AUTOLOAD_PATH env var below.
     private func _load(url: URL) {
-        // A running live session is bound to the previous file's channel
+        do {
+            let sample = try audioFileService.load(url: url)
+            _adoptAsCurrentSample(sample)
+            statusMessage = "Loaded \(url.lastPathComponent)."
+            _addToRecentFiles(url)
+        } catch {
+            statusMessage = "Failed to load: \(error)"
+        }
+    }
+
+    /// The shared "this is now the source we're working on" reset --
+    /// factored out of `_load` for 2.3's "Use as Source" chaining feature
+    /// (`_useProcessedAsSource`), which needs the exact same reset against
+    /// an in-memory `LoadedSample` that never went through
+    /// `audioFileService.load`/a real file URL. Recent-files bookkeeping
+    /// is deliberately NOT part of this -- `_load` adds its own real,
+    /// on-disk URL after calling this; chaining has no on-disk file yet.
+    private func _adoptAsCurrentSample(_ sample: LoadedSample) {
+        // A running live session is bound to the previous source's channel
         // count and sample rate -- simplest and safest is to stop it
         // rather than try to reconcile those with whatever loads next.
         // Offline playback (AudioPlaybackController) reconnects itself to
-        // a new file's format on the next play(), so stopping it here is
-        // just "don't keep the old file sounding".
+        // a new source's format on the next play(), so stopping it here is
+        // just "don't keep the old source sounding".
         isLiveAuditionOn = false
         _stopLiveAudition()
         playback.stop()
         isPlayingOffline = false
 
-        do {
-            let sample = try audioFileService.load(url: url)
-            loadedSample = sample
-            statusMessage = "Loaded \(url.lastPathComponent)."
-            lastVerifyResult = nil
-            processedChannels = nil
-            processedWaveformSamples = nil
-            renderedSnapshot = nil
-            startFrame = 0 // file-specific -- a new file's start point is 0, never inherited
-            renderedStartFrame = nil
-            playingSource = .none
-            playheadFraction = nil
-            _addToRecentFiles(url)
+        loadedSample = sample
+        lastVerifyResult = nil
+        processedChannels = nil
+        processedWaveformSamples = nil
+        renderedSnapshot = nil
+        startFrame = 0 // source-specific -- a new source's start point is 0, never inherited
+        renderedStartFrame = nil
+        playingSource = .none
+        playheadFraction = nil
 
-            let interleaved = PCMConversion.toFloat(sample.rawData, format: sample.format)
-            let channels = PCMConversion.deinterleave(interleaved, channelCount: sample.channelCount)
-            originalWaveformSamples = channels.first ?? []
-        } catch {
-            statusMessage = "Failed to load: \(error)"
-        }
+        let interleaved = PCMConversion.toFloat(sample.rawData, format: sample.format)
+        let channels = PCMConversion.deinterleave(interleaved, channelCount: sample.channelCount)
+        originalWaveformSamples = channels.first ?? []
+    }
+
+    /// 2.3 feedback (the S950 chain-restretch trick: stretch, then stretch
+    /// the *result* again, repeatably, for longer/gnarlier output) --
+    /// deliberately no limit on how many times, per the user's own call
+    /// not to model the hardware's "enough already" ceiling.
+    ///
+    /// Reuses saveProcessed()'s exact LoadedSample construction (interleave
+    /// -> PCMConversion.fromFloat -> LoadedSample), just hands the result
+    /// to `_adoptAsCurrentSample` instead of a save panel -- in-memory
+    /// only, no file write. `channels` is already trimmed to the current
+    /// start point (see playProcessed's comment), so chaining also folds
+    /// in whatever start-point trim was set, which is the intended
+    /// behaviour: the new source IS what was actually processed.
+    ///
+    /// Undo/redo are cleared, not carried over: the param *values* are
+    /// untouched, but every snapshot on either stack describes an edit
+    /// against the OLD source -- undoing past this point would silently
+    /// re-render old parameter values against audio they were never
+    /// designed against.
+    private func _useProcessedAsSource() {
+        guard let sample = loadedSample, let channels = processedChannels else { return }
+        let interleaved = PCMConversion.interleave(channels)
+        let rawData = PCMConversion.fromFloat(interleaved, format: sample.format)
+        let newSample = LoadedSample(url: sample.url, format: sample.format, rawData: rawData)
+        _adoptAsCurrentSample(newSample)
+        undoStack.removeAll()
+        redoStack.removeAll()
+        statusMessage = "Using processed render as the new source -- chain again, or Save Processed to keep this generation on disk."
     }
 
     private func _addToRecentFiles(_ url: URL) {

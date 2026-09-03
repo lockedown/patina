@@ -32,6 +32,17 @@ struct PatinaApp: App {
         WindowGroup {
             ContentView()
         }
+        // 2.3 feedback: a first launch (no restored window frame yet) opened
+        // at ContentView's own 720x600 *minimum*, which is too narrow for the
+        // sidebar (220pt) plus a full 7-knob row (INTELLIGENT mode on a
+        // resonance-capable machine: Transpose/Stretch/Cycle/Cutoff/
+        // Resonance/Quality/Width, 72pt each) -- the knob row got clipped
+        // until the user manually resized wider. Sized to fit that worst
+        // case plus the LCD readout and a loaded waveform with no
+        // scrolling. Doesn't touch the 720x600 floor in
+        // ContentView.swift's .frame(minWidth:minHeight:) -- that's the
+        // resize floor, a separate, already-correct constraint.
+        .defaultSize(width: 960, height: 760)
         // Parameter undo/redo (see ParamSnapshot, ContentView's
         // undoStack/redoStack) -- replacing the system Undo/Redo item
         // rather than adding a separate one, since this app has no other

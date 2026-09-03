@@ -43,10 +43,7 @@ struct KnobCell: View {
             RotaryKnobView(
                 value: $value, range: range, taper: taper, step: step, defaultValue: defaultValue,
                 onEditingChanged: onEditingChanged,
-                onRequestTextEntry: {
-                    editingText = _trimmedNumber(value)
-                    isFieldFocused = true
-                }
+                onRequestTextEntry: _openTextEntry
             )
 
             if editingText != nil {
@@ -67,9 +64,18 @@ struct KnobCell: View {
                 Text(String(format: format, value))
                     .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(.primary)
+                    // 2.3 feedback: double-click worked on the knob but not
+                    // on this readout -- same entry point, just a second
+                    // gesture source.
+                    .onTapGesture(count: 2) { _openTextEntry() }
             }
         }
         .frame(width: 72)
+    }
+
+    private func _openTextEntry() {
+        editingText = _trimmedNumber(value)
+        isFieldFocused = true
     }
 
     /// A short, plain decimal -- e.g. "150", "0.25", "-12" -- with no
