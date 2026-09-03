@@ -1076,6 +1076,16 @@ struct ContentView: View {
     /// actor.
     private func _handleDrop(providers: [NSItemProvider]) -> Bool {
         guard let provider = providers.first else { return false }
+        // Reject the app's own drag-out export outright -- see
+        // UTType.patinaOwnDragExport's comment (ProcessedWavExport.swift)
+        // for why letting this fall through to loadFileRepresentation
+        // below (which used to be the only guard, and still is one, in
+        // _loadDroppedURL) isn't good enough: that check runs AFTER the
+        // drop is accepted and materialize/write already happened, too
+        // late to avoid the self-drop hang this is actually fixing.
+        if provider.hasItemConformingToTypeIdentifier(UTType.patinaOwnDragExport.identifier) {
+            return false
+        }
         let candidateTypes = [UTType.wav.identifier, UTType.aiff.identifier, UTType.fileURL.identifier]
         guard let typeID = candidateTypes.first(where: { provider.hasItemConformingToTypeIdentifier($0) }) else {
             return false
