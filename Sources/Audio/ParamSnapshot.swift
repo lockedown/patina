@@ -17,7 +17,14 @@
 
 import AkaizerCore
 
-public struct ParamSnapshot: Equatable {
+// Explicit Sendable conformance (2.3.2): every stored property is a plain
+// Double or a Clang-imported C enum wrapper, both genuinely Sendable --
+// the compiler just can't infer that across the AkaizerCore module
+// boundary without @preconcurrency on every importer, so it's declared
+// here instead. Needed once ProcessedWavExport.swift started passing a
+// ParamSnapshot into a @Sendable closure (the drag-export fix that
+// stopped awaiting the MainActor hop -- see that file's comment).
+public struct ParamSnapshot: Equatable, Sendable {
     public var machine: AkzMachine
     public var engine: AkzEngine
     public var mode: AkzStretchMode

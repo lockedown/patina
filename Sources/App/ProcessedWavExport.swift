@@ -76,13 +76,16 @@ struct ProcessedWavExport: Transferable {
 
     static var transferRepresentation: some TransferRepresentation {
         FileRepresentation(exportedContentType: .wav) { item in
-            SentTransferredFile(try await item._materialize())
+            let url = try await item._materialize()
+            return SentTransferredFile(url)
         }
         // Cheap, never actually materialized on a self-drop -- see
         // UTType.patinaOwnDragExport's comment above. `_handleDrop`
         // checks for this type identifier's mere PRESENCE and bails out
         // before touching the .wav representation at all.
-        DataRepresentation(exportedContentType: .patinaOwnDragExport) { _ in Data() }
+        DataRepresentation(exportedContentType: .patinaOwnDragExport) { _ in
+            return Data()
+        }
     }
 
     private func _materialize() async throws -> URL {
@@ -98,7 +101,18 @@ struct ProcessedWavExport: Transferable {
             }.value
             let rendered = channels
             let snap = snapshot
-            await MainActor.run { onRendered?(rendered, snap) }
+            // 2.3.2: this used to be `await MainActor.run { onRendered?(...) }`
+            // -- confirmed by debug log to be exactly where a drag that
+            // starts (materialize begins) but never gets dropped anywhere
+            // stalls forever: the log showed "hopping to MainActor" and
+            // then NOTHING further for that call, ever, until the OS's own
+            // ~60s unresponsive-app timeout finally let termination
+            // proceed. onRendered only updates ContentView's @State for
+            // the UI to pick up (processedChannels/renderedSnapshot) --
+            // nothing downstream in THIS function depends on it having
+            // run yet, so there's no correctness reason to block on it.
+            // Fire it and move straight on to writing the file.
+            DispatchQueue.main.async { onRendered?(rendered, snap) }
         }
 
         // A per-drag UUID *directory* (not a UUID filename, unlike

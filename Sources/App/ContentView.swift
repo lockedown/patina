@@ -62,6 +62,24 @@ struct ContentView: View {
     /// same as ParamSnapshot.defaults(for:) would give it.
     @State private var sampleRateHz: Double = ParamSnapshot.defaults(for: Self.initialMachine).sampleRateHz
     @State private var processedChannels: [[Float]]?
+    /// True whenever `processedChannels` holds a render that hasn't been
+    /// written to disk yet (Save Processed/Save Preview, or a completed
+    /// drag-out export) -- 2.3.2 feedback: closing the window now quits
+    /// the whole app (see PatinaApp's `applicationShouldTerminateAfter
+    /// LastWindowClosed`), so losing an unsaved render on an accidental
+    /// close/quit needs a real "are you sure" gate, not just an assumption
+    /// nothing valuable was ever in flight.
+    ///
+    /// A plain proxy onto `QuitGuard.shared`, not its own `@State` --
+    /// `AppDelegate` (PatinaApp.swift) is a plain NSObject, not a SwiftUI
+    /// View, so it has no way to read this struct's @State directly, and
+    /// nothing in THIS view's body renders differently based on the flag
+    /// (it only gates termination), so there's no observation to lose by
+    /// not using @State.
+    private var hasUnsavedProcessedAudio: Bool {
+        get { QuitGuard.shared.hasUnsavedProcessedAudio }
+        nonmutating set { QuitGuard.shared.hasUnsavedProcessedAudio = newValue }
+    }
 
     @State private var isLiveAuditionOn = false
     @State private var liveController: LiveAuditionController?
@@ -380,6 +398,11 @@ struct ContentView: View {
             _mainContent
         }
         .frame(minWidth: 720, minHeight: 600)
+        // 2.3.2: installs QuitAwareWindowDelegate on the real NSWindow --
+        // see PatinaApp.swift's WindowCloseGate/QuitAwareWindowDelegate
+        // for why the red close button needs its own gate, separate from
+        // applicationShouldTerminate's Cmd+Q gate.
+        .withQuitAwareWindowClose()
         // Attached to the whole window's root, not to any child --
         // drag-and-drop is NSDraggingDestination, a different mechanism
         // from gesture recognition, so nested ScrollViews and the knobs'
@@ -498,13 +521,23 @@ struct ContentView: View {
                 }
             }
 
-            Text("RECENT")
-                .font(.caption.weight(.semibold))
-                .tracking(1.0)
-                .foregroundStyle(.secondary)
-                .padding(.top, 16)
-                .padding(.horizontal, 14)
-                .padding(.bottom, 6)
+            HStack {
+                Text("RECENT")
+                    .font(.caption.weight(.semibold))
+                    .tracking(1.0)
+                    .foregroundStyle(.secondary)
+                if !recentFiles.isEmpty {
+                    Spacer()
+                    Button("Clear", action: _clearRecentFiles)
+                        .buttonStyle(.plain)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .help("Remove every entry from the Recent list. Doesn't touch the files themselves.")
+                }
+            }
+            .padding(.top, 16)
+            .padding(.horizontal, 14)
+            .padding(.bottom, 6)
 
             if recentFiles.isEmpty {
                 Text("Open a file to get started.")
@@ -992,6 +1025,7 @@ struct ContentView: View {
         processedChannels = nil
         processedWaveformSamples = nil
         renderedSnapshot = nil
+        hasUnsavedProcessedAudio = false
         startFrame = 0 // source-specific -- a new source's start point is 0, never inherited
         renderedStartFrame = nil
         playingSource = .none
@@ -1040,6 +1074,15 @@ struct ContentView: View {
         recentFilesStore.save(recentFiles)
     }
 
+    /// 2.3.2 feedback: a way to clear the Recent list. Doesn't touch any
+    /// file on disk -- this list is just a shortcut back to files already
+    /// opened once, same as `_addToRecentFiles` only ever adds a
+    /// reference, never a copy.
+    private func _clearRecentFiles() {
+        recentFiles = []
+        recentFilesStore.save(recentFiles)
+    }
+
     /// Loads AKAIZER_AUTOLOAD_PATH on launch if set. Exists so the app's
     /// real audio behaviour can be driven and verified (via `swift run`
     /// or the built binary) without going through NSOpenPanel, whose
@@ -1075,7 +1118,9 @@ struct ContentView: View {
     /// copied into our own temp location before returning to the main
     /// actor.
     private func _handleDrop(providers: [NSItemProvider]) -> Bool {
-        guard let provider = providers.first else { return false }
+        guard let provider = providers.first else {
+            return false
+        }
         // Reject the app's own drag-out export outright -- see
         // UTType.patinaOwnDragExport's comment (ProcessedWavExport.swift)
         // for why letting this fall through to loadFileRepresentation
@@ -1107,7 +1152,9 @@ struct ContentView: View {
                 try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
                 let destination = stagingDir.appendingPathComponent(url.lastPathComponent)
                 try FileManager.default.copyItem(at: url, to: destination)
-                DispatchQueue.main.async { _loadDroppedURL(destination) }
+                DispatchQueue.main.async {
+                    _loadDroppedURL(destination)
+                }
             } catch {
                 DispatchQueue.main.async {
                     statusMessage = "Couldn't read the dropped file: \(error.localizedDescription)"
@@ -1434,6 +1481,7 @@ struct ContentView: View {
         processedWaveformSamples = nil
         renderedSnapshot = nil
         renderedStartFrame = nil
+        hasUnsavedProcessedAudio = false
         statusMessage = "Reverted to \(machineProfile.displayName) defaults."
     }
 
@@ -1550,6 +1598,7 @@ struct ContentView: View {
         processedWaveformSamples = outputChannels.first
         renderedSnapshot = snapshot
         renderedStartFrame = startFrame
+        hasUnsavedProcessedAudio = true
         let outFrames = outputChannels.first?.count ?? 0
         statusMessage = "Processed: \(sample.frameCount) → \(outFrames) frames (\(String(format: "%.2f", Double(outFrames) / sample.sampleRateHz))s)."
     }
@@ -1613,6 +1662,7 @@ struct ContentView: View {
             let processedSample = LoadedSample(url: url, format: sample.format, rawData: rawData)
             try audioFileService.save(processedSample, to: url)
             statusMessage = "Saved processed audio to \(url.lastPathComponent)."
+            hasUnsavedProcessedAudio = false
         }
     }
 
@@ -1640,7 +1690,8 @@ struct ContentView: View {
             processedWaveformSamples = channels.first
             renderedSnapshot = snapshot
             renderedStartFrame = capturedStartFrame
-            saveProcessed()
+            hasUnsavedProcessedAudio = true
+            saveProcessed() // clears hasUnsavedProcessedAudio back to false on a completed save
         }
     }
 
@@ -1658,8 +1709,11 @@ struct ContentView: View {
             startFrame: capturedStartFrame,
             fileName: sample.url.deletingPathExtension().lastPathComponent + "-stretched.wav",
             onRendered: { channels, snapshot in
-                // ProcessedWavExport invokes this via `await
-                // MainActor.run`, so it's genuinely always on the main
+                // ProcessedWavExport invokes this via `DispatchQueue.main.
+                // async` (2.3.2 -- was `await MainActor.run`, changed
+                // because that specific await was where an abandoned/
+                // never-dropped drag would hang forever; see that file's
+                // comment), so it's still genuinely always on the main
                 // actor -- assumeIsolated tells the compiler that rather
                 // than hopping again, since the @Sendable closure type
                 // (required to cross into the async export path) can't
@@ -1669,6 +1723,7 @@ struct ContentView: View {
                     processedWaveformSamples = channels.first
                     renderedSnapshot = snapshot
                     renderedStartFrame = capturedStartFrame
+                    hasUnsavedProcessedAudio = true
                 }
             }
         )
