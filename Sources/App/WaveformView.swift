@@ -8,13 +8,23 @@
 //
 // 2.1 feedback ("show playback bar over sample waveform... click and
 // move start point with mouse") made this genuinely interactive: a
-// playhead bar tracks whichever source is currently playing, and
-// clicking/dragging the waveform moves the start point playback and
-// rendering trim from. Stays a dumb view -- no @State, no knowledge of
+// playhead bar tracks whichever source is currently playing. 2.1 put
+// click/drag-to-scrub on the whole surface and moved drag-out export to a
+// small corner grip, because a DragGesture and .draggable() covering the
+// same view fight over the same mouse-down-and-move. 2.3 feedback asked
+// for the pre-2.1 click-and-drag-to-export behaviour back, with start-point
+// moving demoted to a modifier -- so the gesture split is now by
+// modifier/kind, not by which sub-area of the view you touch: a bare
+// click-and-drag anywhere on the waveform is a real .draggable() export
+// drag (whole surface, like pre-2.1), and Shift+click (a tap, not a drag)
+// moves the start point. A tap and a drag-initiating gesture don't compete
+// the way two drag-recognizers did, which is what makes sharing the view
+// possible this time. Stays a dumb view -- no @State, no knowledge of
 // ContentView's playback controllers -- everything it needs (traces,
 // fractions, callbacks) is passed in, same as before.
 
 import AkaizerAudio
+import AppKit
 import SwiftUI
 
 struct WaveformView: View {
@@ -36,16 +46,13 @@ struct WaveformView: View {
     /// version of either) into this shared fraction is ContentView's
     /// job, not this view's -- it only draws where it's told.
     let playheadFraction: Double?
-    /// Backs the drag handle's .draggable() -- kept off the waveform
-    /// body itself (see the grip overlay below) so it doesn't compete
-    /// with the scrub DragGesture on the same view.
+    /// Backs the whole waveform surface's .draggable() -- see body's
+    /// header comment for why this and the Shift+click scrub below can
+    /// share the same view now, where a DragGesture covering the whole
+    /// surface couldn't.
     let dragExport: ProcessedWavExport
-    /// Fired continuously while dragging, and once more on release --
-    /// both carry the shared-space fraction at the current/final
-    /// location. `minimumDistance: 0` on the underlying gesture means a
-    /// bare click fires both in the same instant, satisfying "click OR
-    /// drag" with one gesture.
-    let onScrubChanged: (Double) -> Void
+    /// Fired on a Shift+click (see body) -- carries the shared-space
+    /// fraction at the click location.
     let onScrubEnded: (Double) -> Void
 
     private static let background = Color(red: 0.047, green: 0.078, blue: 0.063) // #0C1410, matches LCDReadoutView
@@ -88,21 +95,21 @@ struct WaveformView: View {
                 .strokeBorder(Self.dimGreen.opacity(0.55), lineWidth: 1)
         )
         .overlay { _transportOverlay }
+        .draggable(dragExport)
         .overlay(alignment: .topTrailing) {
-            // The drag-out export handle -- deliberately a small,
-            // visible grip rather than the whole waveform surface (which
-            // used to carry .draggable() directly): a SwiftUI
-            // DragGesture and an AppKit-backed .draggable() on the same
-            // view don't compose predictably, and a bare tooltip was the
-            // only clue the old whole-surface drag existed at all. This
-            // both resolves the gesture conflict and makes drag-out
-            // export discoverable.
+            // 2.3: the export drag itself lives on the whole surface again
+            // (see .draggable above and the file header comment) -- this
+            // icon is now purely a discoverability hint, not a second drag
+            // source, since a click+drag anywhere already exports. Kept
+            // because Shift+click-to-move-start-point is a second,
+            // non-obvious modifier gesture on the same view, and 2.1
+            // already learned the hard way that a bare tooltip alone
+            // isn't enough of a clue that a gesture exists at all.
             Image(systemName: "square.and.arrow.up")
                 .font(.caption)
                 .foregroundStyle(Self.dimGreen)
                 .padding(6)
-                .draggable(dragExport)
-                .help("Drag out to export the processed audio as a .wav")
+                .allowsHitTesting(false)
         }
     }
 
@@ -143,12 +150,19 @@ struct WaveformView: View {
             // over a sliver near the marker, not the whole waveform.
             .frame(width: width, height: proxy.size.height, alignment: .topLeading)
             .contentShape(Rectangle())
+            // Shift+click moves the start point -- a tap, not a drag, so
+            // it doesn't compete with the whole-surface .draggable()
+            // export gesture in body above (see file header comment).
+            // SpatialTapGesture (not plain onTapGesture) is used because
+            // it's the one that hands back a location; NSEvent's modifier
+            // flags are checked directly, the same pattern
+            // RotaryKnobView's Option-click reset already uses, since a
+            // SwiftUI gesture carries no modifier info of its own on
+            // macOS.
             .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { value in
-                        onScrubChanged(WaveformGeometry.fraction(forX: value.location.x, width: width))
-                    }
+                SpatialTapGesture()
                     .onEnded { value in
+                        guard NSEvent.modifierFlags.contains(.shift) else { return }
                         onScrubEnded(WaveformGeometry.fraction(forX: value.location.x, width: width))
                     }
             )
