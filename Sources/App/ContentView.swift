@@ -139,10 +139,6 @@ struct ContentView: View {
     /// own examples. Persisted via PresetStore, loaded once on launch.
     @State private var presets: [AkaizerPreset] = []
 
-    /// Filters the sidebar's MACHINES section (v2 heritage-roster plan,
-    /// stage 9) -- only shown once the roster is long enough to need it.
-    @State private var machineSearchText: String = ""
-
     /// Mono (channel 0) traces for WaveformView. Decoded once per load/
     /// process rather than in the view body, so scrolling/resizing the
     /// window doesn't re-decode a whole file's worth of PCM every frame.
@@ -464,23 +460,16 @@ struct ContentView: View {
 
     // -- layout --------------------------------------------------------------
 
-    /// Machines filtered by `machineSearchText`, grouped by manufacturer
-    /// -- v2 heritage-roster plan, stage 9: replaces the flat Machine
-    /// Picker once the roster grows past six. Groups are ordered by
-    /// each manufacturer's first appearance in
-    /// StretchProcessor.allMachines (itself AkzMachine's declaration
-    /// order), not alphabetically -- Akai first, matching the app's own
-    /// history.
+    /// Machines grouped by manufacturer -- v2 heritage-roster plan,
+    /// stage 9: replaces the flat Machine Picker once the roster grows
+    /// past six. Groups are ordered by each manufacturer's first
+    /// appearance in StretchProcessor.allMachines (itself AkzMachine's
+    /// declaration order), not alphabetically -- Akai first, matching
+    /// the app's own history.
     private var _groupedMachines: [(manufacturer: String, machines: [AkzMachine])] {
-        let filtered = StretchProcessor.allMachines.filter { machine in
-            guard !machineSearchText.isEmpty else { return true }
-            let profile = StretchProcessor.profile(for: machine)
-            return profile.displayName.localizedCaseInsensitiveContains(machineSearchText)
-                || profile.manufacturerName.localizedCaseInsensitiveContains(machineSearchText)
-        }
         var order: [String] = []
         var groups: [String: [AkzMachine]] = [:]
-        for machine in filtered {
+        for machine in StretchProcessor.allMachines {
             let manufacturer = StretchProcessor.profile(for: machine).manufacturerName
             if groups[manufacturer] == nil { order.append(manufacturer) }
             groups[manufacturer, default: []].append(machine)
@@ -497,18 +486,7 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
                 .padding(.top, 16)
                 .padding(.horizontal, 14)
-                .padding(.bottom, 6)
-
-            // Only worth the pixels once the roster is long enough to
-            // need it -- a fixed threshold rather than always-on, since
-            // six machines fit on screen with room to spare.
-            if StretchProcessor.allMachines.count > 8 {
-                TextField("Filter…", text: $machineSearchText)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.caption)
-                    .padding(.horizontal, 14)
-                    .padding(.bottom, 4)
-            }
+                .padding(.bottom, 2)
 
             ForEach(_groupedMachines, id: \.manufacturer) { group in
                 Text(group.manufacturer.uppercased())
@@ -859,6 +837,9 @@ struct ContentView: View {
                         Button("Revert", action: _revertToOriginal)
                             .disabled(loadedSample == nil || (_snapshot() == .defaults(for: selectedMachine) && processedChannels == nil))
                             .help("Reset all parameters to \(machineProfile.displayName) defaults and discard the processed render. Does not modify the file on disk.")
+                        Button("Defaults", action: _resetToMachineDefaults)
+                            .disabled(loadedSample == nil || _snapshot() == .defaults(for: selectedMachine))
+                            .help("Reset all parameters to \(machineProfile.displayName) defaults. Keeps the processed render, if any -- unlike Revert.")
                         // A/B: "compares processed against dry original
                         // at matched loudness" (plan) -- Play Processed
                         // scales its output to match Play Original's RMS
@@ -1354,48 +1335,59 @@ struct ContentView: View {
     /// be raced against a bulk write that also touches selectedMachine
     /// (undo restore, preset apply, revert): whichever one's onChange
     /// fires later would silently clobber the other. Doing the "new
-    /// machine -> reset everything else" work here instead, synchronously,
-    /// means bulk writes go through _applySnapshot() below and never
-    /// trigger this at all -- there's nothing left to race.
+    /// machine" work here instead, synchronously, means bulk writes go
+    /// through _applySnapshot() below and never trigger this at all --
+    /// there's nothing left to race.
+    ///
+    /// 2.4: this used to reset the other ten params to the new machine's
+    /// defaults. It now CARRIES them across instead (change request:
+    /// "maintain knob settings between emulators... allow same sample
+    /// with same settings to stay in place while flipping between
+    /// emulators") -- see ParamSnapshot.adapted(to:) for the two rules
+    /// (clamp a knob the new machine shows into its own range, leave a
+    /// knob it doesn't show completely alone) and why a parked value is
+    /// inaudible regardless. Both routes back to a machine's own
+    /// defaults are unchanged and unaffected: the Defaults button
+    /// (_resetToMachineDefaults) and double-clicking any single knob
+    /// (_defaultValue(for:)). The explicit .adapted(to:) here is
+    /// redundant with _applySnapshot's own self-adaptation below -- kept
+    /// anyway so the feature is named at the call site the user actually
+    /// triggers it from; adapted(to:) is idempotent, so the redundancy
+    /// costs nothing.
+    ///
+    /// Live audition stays running across the switch (v2 heritage-
+    /// roster plan, stage 11 fix -- it used to force-stop for any non-
+    /// stretch machine, under the same flawed assumption the Preview/
+    /// Process buttons' old `!_stretchIsSupported` guard made): the
+    /// engine is never torn down, _applySnapshot's own
+    /// _pushLiveParamsIfNeeded pushes the new params, and the worker's
+    /// full re-render path (a machine change always fails
+    /// StretchEngine::paramsDifferOnlyInFilter) restarts the sample from
+    /// position 0 on one audio frame across every channel at once.
     private func _selectMachine(_ machine: AkzMachine) {
         guard machine != selectedMachine else { return }
         _pushUndo(_snapshot())
-        selectedMachine = machine
-        let defaults = ParamSnapshot.defaults(for: machine)
-        stretchPercent = defaults.stretchPercent
-        cycleLength = defaults.cycleLength
-        quality = defaults.quality
-        width = defaults.width
-        transposeSemitones = defaults.transposeSemitones
-        filterCutoff = defaults.filterCutoff
-        filterResonance = defaults.filterResonance
-        sampleRateHz = defaults.sampleRateHz
-        // S950 has no CYCLIC/INTELLIGENT switch at all (Mon1/Pol2
-        // instead -- plan section 3.2). Force the picker back to a real
-        // state rather than silently ignoring a stale "Intelligent"
-        // selection the engine itself would ignore too.
-        if StretchProcessor.profile(for: machine).hasModeSwitch == 0 {
-            selectedMode = AkzStretchMode_Cyclic
-        }
-        // Live audition stays running across a machine switch (v2
-        // heritage-roster plan, stage 11 fix) -- it used to force-stop
-        // for any non-stretch machine, under the same flawed assumption
-        // the Preview/Process buttons' old `!_stretchIsSupported` guard
-        // made: that a machine with no time-stretch has nothing worth
-        // previewing. Filter, transpose and (now) bandwidth all still
-        // apply and are all audible live; StretchEngine.cpp's own
-        // supportsTimeStretch gate makes sending it stretch params on
-        // such a machine harmless regardless.
-        _pushLiveParamsIfNeeded()
+        _applySnapshot(_snapshot().adapted(to: machine))
     }
 
     /// Assigns all eleven params from a snapshot in one shot -- undo
-    /// restore, revert, and preset apply all funnel through this.
-    /// Assigning selectedMachine directly here (never through
-    /// _selectMachine) is what keeps a bulk write from triggering the
-    /// machine-change reset above and clobbering the very values being
-    /// restored.
+    /// restore, revert, preset apply, and _selectMachine all funnel
+    /// through this. Assigning selectedMachine directly here (never
+    /// through _selectMachine) is what keeps a bulk write from
+    /// triggering _selectMachine's own carry-over logic and clobbering
+    /// the very values being restored.
     private func _applySnapshot(_ s: ParamSnapshot) {
+        // Self-adapts (2.4) -- one carry-over rule shared with
+        // _selectMachine, so an undo/redo step or a preset apply can't
+        // quietly re-clamp a value _selectMachine just carried across.
+        // Before this, the sampleRateHz clamp just below ran
+        // unconditionally: an S950 rate of 48kHz carried onto the S1000
+        // would survive the switch itself only to get rewritten to
+        // 44100 on the very next undo step. Subsumes that clamp's
+        // original purpose too -- machine(forStableId:)'s fallback
+        // machine for an unrecognised preset id is the S950, and the
+        // S950 shows a bandwidth knob, so that range still clamps.
+        let s = s.adapted(to: s.machine)
         selectedMachine = s.machine
         selectedEngine = s.engine
         selectedMode = s.mode
@@ -1406,16 +1398,7 @@ struct ContentView: View {
         transposeSemitones = s.transposeSemitones
         filterCutoff = s.filterCutoff
         filterResonance = s.filterResonance
-        // Clamped into s.machine's own range rather than assigned
-        // directly: machine(forStableId:) falls back to S950 for an
-        // unrecognised id (a preset saved by a future build naming a
-        // machine this one doesn't have), which could otherwise land a
-        // rate from that machine's range onto a different machine's
-        // knob. The DSP clamps regardless (RateModel.cpp), but the LCD/
-        // knob display staying honest is the whole point of 2.1's
-        // bandwidth legibility fix.
-        let profile = StretchProcessor.profile(for: s.machine)
-        sampleRateHz = min(max(s.sampleRateHz, profile.minSampleRateHz), profile.maxSampleRateHz)
+        sampleRateHz = s.sampleRateHz
         _pushLiveParamsIfNeeded()
     }
 
@@ -1483,6 +1466,24 @@ struct ContentView: View {
         renderedStartFrame = nil
         hasUnsavedProcessedAudio = false
         statusMessage = "Reverted to \(machineProfile.displayName) defaults."
+    }
+
+    /// Knobs-only counterpart to Revert, added in 2.4 once a machine
+    /// switch stopped resetting anything (_selectMachine now carries
+    /// settings across instead -- see its own comment). Same underlying
+    /// call as Revert's first half, but deliberately stops there:
+    /// processedChannels/processedWaveformSamples/renderedSnapshot/
+    /// renderedStartFrame/hasUnsavedProcessedAudio are all left alone, so
+    /// a processed render survives. _renderIsStale picks up the change on
+    /// its own next read (it compares renderedSnapshot to the live
+    /// snapshot) -- nothing here needs to set it explicitly. If this ever
+    /// grows to also discard the render, it isn't earning its keep next
+    /// to Revert any more and one of the two should go.
+    private func _resetToMachineDefaults() {
+        _endParamEdit()
+        _pushUndo(_snapshot())
+        _applySnapshot(.defaults(for: selectedMachine))
+        statusMessage = "Reset to \(machineProfile.displayName) defaults."
     }
 
     // -- recomputing busy light + waveform transport poll --------------------

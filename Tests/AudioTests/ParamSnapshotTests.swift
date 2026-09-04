@@ -150,6 +150,187 @@ final class ParamSnapshotTests: XCTestCase {
         let second = snapshot.params
         XCTAssertTrue(memcmp0(first, second))
     }
+
+    // -- adapted(to:) --------------------------------------------------------
+    //
+    // 2.4 change request: "maintain knob settings between emulators."
+    // adapted(to:) replaces _selectMachine's old reset-to-defaults with a
+    // carry-over: clamp a knob into range if the target machine shows it,
+    // leave it completely alone if not. These tests pin the two rules
+    // themselves, the round-trip losslessness that's the actual point of
+    // the feature, and the idempotence _selectMachine's call site leans on
+    // (see ContentView.swift's own comment on why it calls adapted(to:)
+    // even though _applySnapshot self-adapts too).
+
+    /// A value with every field already inside every machine's own range
+    /// (both bandwidth and stretch), so adapted(to:) becomes a pure
+    /// machine + descriptor-clamp no-op -- nothing here should ever move.
+    private func _universallyInRangeSnapshot(machine: AkzMachine, mode: AkzStretchMode) -> ParamSnapshot {
+        ParamSnapshot(
+            machine: machine, engine: AkzEngine_Revised, mode: mode,
+            stretchPercent: 100, cycleLength: 500, quality: 50, width: 50,
+            transposeSemitones: 5, filterCutoff: 0.5, filterResonance: 0.5,
+            sampleRateHz: 22050
+        )
+    }
+
+    /// The headline requirement: a value parked on a machine that hides
+    /// its knob must come back byte-identical once the round trip lands
+    /// back on a machine that shows it again.
+    func testAdaptedRoundTripThroughAMachineWithoutTheKnobRestoresTheValueExactly() {
+        var original = _universallyInRangeSnapshot(machine: AkzMachine_S950, mode: AkzStretchMode_Cyclic)
+        original.sampleRateHz = 12345
+        original.stretchPercent = 500
+
+        let roundTripped = original
+            .adapted(to: AkzMachine_SP1200) // no bandwidth, no stretch knob
+            .adapted(to: AkzMachine_S950)
+
+        XCTAssertEqual(roundTripped, original)
+    }
+
+    func testAdaptedIsAPureMachineSwapWhenEveryValueIsUniversallyInRange() {
+        for from in StretchProcessor.allMachines {
+            for to in StretchProcessor.allMachines {
+                for mode in [AkzStretchMode_Cyclic, AkzStretchMode_Intelligent] {
+                    let base = _universallyInRangeSnapshot(machine: from, mode: mode)
+                    var expected = base
+                    expected.machine = to
+                    XCTAssertEqual(base.adapted(to: to), expected, "\(from) -> \(to), mode \(mode)")
+                }
+            }
+        }
+    }
+
+    func testAdaptedClampsBandwidthIntoTheTargetMachinesOwnRange() {
+        var high = _universallyInRangeSnapshot(machine: AkzMachine_S950, mode: AkzStretchMode_Cyclic)
+        high.sampleRateHz = 48000 // S950's own max
+        XCTAssertEqual(high.adapted(to: AkzMachine_S900).sampleRateHz, 40000) // S900's max
+
+        var low = _universallyInRangeSnapshot(machine: AkzMachine_S950, mode: AkzStretchMode_Cyclic)
+        low.sampleRateHz = 7500 // S950's own min
+        XCTAssertEqual(low.adapted(to: AkzMachine_Mirage).sampleRateHz, 10000) // Mirage's min
+    }
+
+    func testAdaptedClampsStretchIntoTheTargetMachinesOwnMaximum() {
+        var s1000 = _universallyInRangeSnapshot(machine: AkzMachine_S1000, mode: AkzStretchMode_Cyclic)
+        s1000.stretchPercent = 1500
+        XCTAssertEqual(s1000.adapted(to: AkzMachine_S950).stretchPercent, 999)
+
+        var s950 = _universallyInRangeSnapshot(machine: AkzMachine_S950, mode: AkzStretchMode_Cyclic)
+        s950.stretchPercent = 999 // S950's own max
+        // Widening the range on the way to S1000 must never move a value.
+        XCTAssertEqual(s950.adapted(to: AkzMachine_S1000).stretchPercent, 999)
+    }
+
+    /// Stretch is inaudible and invisible on a machine with no stretch
+    /// knob -- StretchEngine.cpp gates it on supportsTimeStretch before
+    /// ever reading timeFactorPercent -- so a parked value must survive
+    /// completely untouched, not clamped into some hidden range.
+    func testAdaptedLeavesStretchParkedOnAMachineWithNoStretchKnob() {
+        var s1000 = _universallyInRangeSnapshot(machine: AkzMachine_S1000, mode: AkzStretchMode_Cyclic)
+        s1000.stretchPercent = 1500
+        XCTAssertEqual(s1000.adapted(to: AkzMachine_SP1200).stretchPercent, 1500)
+    }
+
+    /// Regression pin for the deleted force-to-CYCLIC: a machine with no
+    /// mode switch (S950) must not clobber an INTELLIGENT selection that
+    /// belongs to a machine still ahead in the round trip.
+    func testAdaptedPreservesModeAndEngineThroughAMachineWithNoModeSwitch() {
+        let original = _universallyInRangeSnapshot(machine: AkzMachine_S1000, mode: AkzStretchMode_Intelligent)
+        let roundTripped = original
+            .adapted(to: AkzMachine_S950) // no CYCLIC/INTELLIGENT switch
+            .adapted(to: AkzMachine_S1000)
+        XCTAssertEqual(roundTripped.mode, AkzStretchMode_Intelligent)
+        XCTAssertEqual(roundTripped.engine, original.engine)
+    }
+
+    func testAdaptedPutsEveryVisibleKnobInsideItsOwnRange() {
+        for to in StretchProcessor.allMachines {
+            for mode in [AkzStretchMode_Cyclic, AkzStretchMode_Intelligent] {
+                let descriptors = MachineControls.controls(for: to, mode: mode)
+                for extreme: Double in [1e9, -1e9] {
+                    var base = _universallyInRangeSnapshot(machine: AkzMachine_S950, mode: mode)
+                    base.stretchPercent = extreme
+                    base.cycleLength = extreme
+                    base.quality = extreme
+                    base.width = extreme
+                    base.transposeSemitones = extreme
+                    base.filterCutoff = extreme
+                    base.filterResonance = extreme
+                    base.sampleRateHz = extreme
+
+                    let adapted = base.adapted(to: to)
+                    for descriptor in descriptors {
+                        XCTAssertTrue(
+                            descriptor.range.contains(adapted[descriptor.id]),
+                            "\(descriptor.id) out of range on \(to)/\(mode) from extreme \(extreme)"
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    func testAdaptedIsIdempotent() {
+        for from in StretchProcessor.allMachines {
+            for to in StretchProcessor.allMachines {
+                for mode in [AkzStretchMode_Cyclic, AkzStretchMode_Intelligent] {
+                    var base = _universallyInRangeSnapshot(machine: from, mode: mode)
+                    base.stretchPercent = 1e6
+                    base.sampleRateHz = 1e6
+                    let once = base.adapted(to: to)
+                    XCTAssertEqual(once.adapted(to: to), once, "\(from) -> \(to), mode \(mode)")
+                }
+            }
+        }
+    }
+
+    /// Tripwire for the Float sampleRateHz rounding hazard and for a
+    /// future defaultCycleLength ever leaving 20...2000: a machine's own
+    /// defaults must never be altered by adapting them to itself.
+    func testAdaptedLeavesEveryMachinesOwnDefaultsUntouched() {
+        for machine in StretchProcessor.allMachines {
+            let defaults = ParamSnapshot.defaults(for: machine)
+            XCTAssertEqual(defaults.adapted(to: machine), defaults)
+        }
+    }
+
+    func testSubscriptReadsTheFieldMatchingEachParamID() {
+        let s = _sampleSnapshot()
+        XCTAssertEqual(s[.transpose], s.transposeSemitones)
+        XCTAssertEqual(s[.bandwidth], s.sampleRateHz)
+        XCTAssertEqual(s[.cutoff], s.filterCutoff)
+        XCTAssertEqual(s[.resonance], s.filterResonance)
+        XCTAssertEqual(s[.stretch], s.stretchPercent)
+        XCTAssertEqual(s[.cycle], s.cycleLength)
+        XCTAssertEqual(s[.quality], s.quality)
+        XCTAssertEqual(s[.width], s.width)
+    }
+
+    func testSubscriptWriteTouchesOnlyItsOwnField() {
+        for id in ParamID.allCases {
+            var actual = _sampleSnapshot()
+            actual[id] = 999
+
+            // Built independently of the subscript setter under test --
+            // if it ever wrote to the wrong field, this direct-mutation
+            // copy is what catches it.
+            var expected = _sampleSnapshot()
+            switch id {
+            case .transpose: expected.transposeSemitones = 999
+            case .bandwidth: expected.sampleRateHz = 999
+            case .cutoff: expected.filterCutoff = 999
+            case .resonance: expected.filterResonance = 999
+            case .stretch: expected.stretchPercent = 999
+            case .cycle: expected.cycleLength = 999
+            case .quality: expected.quality = 999
+            case .width: expected.width = 999
+            }
+
+            XCTAssertEqual(actual, expected, "\(id) write touched an unrelated field")
+        }
+    }
 }
 
 /// Byte-for-byte comparison, mirroring the C++ side's memcmp -- XCTAssertEqual
