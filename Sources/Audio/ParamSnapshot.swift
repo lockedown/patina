@@ -103,3 +103,88 @@ public extension AkaizerPreset {
     /// not change just because ParamSnapshot exists.
     var snapshot: ParamSnapshot { ParamSnapshot(params: params) }
 }
+
+public extension ParamSnapshot {
+    /// One canonical ParamID -> stored-value correspondence, so anything
+    /// walking MachineControls' descriptors (adapted(to:) below) doesn't
+    /// carry its own copy of it. Exhaustive on purpose: a new ParamID
+    /// case won't compile until it's mapped here. ContentView's
+    /// `_binding(for:)` still maps the same IDs onto its @State vars --
+    /// that's a mapping to STORAGE, not to a value, and can't move here
+    /// without the SamplerModel extraction the v2 plan skipped.
+    subscript(id: ParamID) -> Double {
+        get {
+            switch id {
+            case .transpose: return transposeSemitones
+            case .bandwidth: return sampleRateHz
+            case .cutoff: return filterCutoff
+            case .resonance: return filterResonance
+            case .stretch: return stretchPercent
+            case .cycle: return cycleLength
+            case .quality: return quality
+            case .width: return width
+            }
+        }
+        set {
+            switch id {
+            case .transpose: transposeSemitones = newValue
+            case .bandwidth: sampleRateHz = newValue
+            case .cutoff: filterCutoff = newValue
+            case .resonance: filterResonance = newValue
+            case .stretch: stretchPercent = newValue
+            case .cycle: cycleLength = newValue
+            case .quality: quality = newValue
+            case .width: width = newValue
+            }
+        }
+    }
+
+    /// The same settings, carried onto `machine` -- 2.4 change request:
+    /// "maintain knob settings between emulators... allow same sample
+    /// with same settings to stay in place while flipping between
+    /// emulators." Replaces the reset-to-that-machine's-defaults
+    /// behaviour _selectMachine used to have. Two rules:
+    ///
+    /// 1. A knob the target machine actually SHOWS (per
+    ///    MachineControls.controls(for:mode:)) is clamped into that
+    ///    knob's own range. An S1000 at 1500% arriving on an S950 (max
+    ///    999%) must read 999 -- lossy on purpose: a knob displaying a
+    ///    value outside its own travel, that the DSP then clamps
+    ///    anyway, is the illegibility 2.1 fixed for bandwidth.
+    /// 2. A knob the target machine does NOT show is left completely
+    ///    alone -- not reset, not clamped. Nothing can see or hear it
+    ///    while parked: the knob row, the LCD rows and the DSP are all
+    ///    gated on the same capability flags (StretchEngine.cpp's
+    ///    supportsTimeStretch and effectiveMode gates, FilterModel.h's
+    ///    resonance gate, RateModel.h's fixed-rate collapse). The
+    ///    payoff is a lossless round trip: S950 at 48kHz -> SP-1200 ->
+    ///    S950 gives 48kHz back exactly, where clamping would have
+    ///    quietly rewritten it to that machine's fixed 26.04kHz.
+    ///
+    /// `mode` and `engine` ride through untouched. Mode used to be
+    /// forced to CYCLIC on a machine with no mode switch; that only
+    /// threw away an S1000 user's INTELLIGENT selection on the way
+    /// through an S950, since every consumer already ignores it without
+    /// the switch (ContentView._isIntelligentMode, controls(for:mode:),
+    /// StretchEngine's effectiveMode). Leaving it alone also means the
+    /// mode passed to controls() below IS the result's own mode -- no
+    /// chicken-and-egg, and the transform is idempotent.
+    ///
+    /// Descriptor-driven rather than hand-clamping the two ranges that
+    /// actually vary today (bandwidth, stretch): the visible set and the
+    /// ranges come from one place, so a future profile whose cutoff or
+    /// cycle range narrows is handled by construction. Cannot build an
+    /// invalid range -- it only ever READS descriptor.range, and the
+    /// `25...maxStretchPercent` descriptor is only emitted when
+    /// supportsTimeStretch != 0 (see MachineControls.swift's own note on
+    /// why there's no max(25.0, ...) there).
+    func adapted(to machine: AkzMachine) -> ParamSnapshot {
+        var result = self
+        result.machine = machine
+        for descriptor in MachineControls.controls(for: machine, mode: mode) {
+            let range = descriptor.range
+            result[descriptor.id] = min(max(result[descriptor.id], range.lowerBound), range.upperBound)
+        }
+        return result
+    }
+}
