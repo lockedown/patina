@@ -1,0 +1,217 @@
+// PluginProcessor.cpp
+//
+// See PluginProcessor.h.
+
+#include "PluginProcessor.h"
+#include "PluginEditor.h"
+
+namespace {
+
+constexpr const char* kMachineParamId = "machine";
+constexpr const char* kBitDepthParamId = "bitDepth";
+constexpr const char* kBandwidthParamId = "bandwidth";
+constexpr const char* kCutoffParamId = "cutoff";
+constexpr const char* kResonanceParamId = "resonance";
+constexpr const char* kMixParamId = "mix";
+constexpr const char* kOutputParamId = "outputDb";
+
+} // namespace
+
+juce::StringArray PatinaFXAudioProcessor::machineChoices() {
+    juce::StringArray choices;
+    for (size_t i = 0; i < akz_machine_count(); ++i) {
+        choices.add(akz_machine_profile(static_cast<AkzMachine>(i))->name);
+    }
+    return choices;
+}
+
+juce::String PatinaFXAudioProcessor::stableIdForMachine(AkzMachine machine) {
+    return akz_machine_profile(machine)->stableId;
+}
+
+AkzMachine PatinaFXAudioProcessor::machineForStableId(const juce::String& stableId) {
+    for (size_t i = 0; i < akz_machine_count(); ++i) {
+        const AkzMachine machine = static_cast<AkzMachine>(i);
+        if (stableId == akz_machine_profile(machine)->stableId) {
+            return machine;
+        }
+    }
+    return AkzMachine_S950; // fallback -- an unrecognised id (older/newer roster) lands on a sensible default rather than machine 0
+}
+
+PatinaFXAudioProcessor::PatinaFXAudioProcessor()
+    : AudioProcessor(BusesProperties()
+          .withInput("Input", juce::AudioChannelSet::stereo(), true)
+          .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
+      apvts(*this, nullptr, "PARAMETERS", _createParameterLayout()) {
+}
+
+PatinaFXAudioProcessor::~PatinaFXAudioProcessor() {
+    _destroyChannels();
+}
+
+juce::AudioProcessorValueTreeState::ParameterLayout PatinaFXAudioProcessor::_createParameterLayout() {
+    juce::AudioProcessorValueTreeState::ParameterLayout layout;
+
+    // Defaults resolve to the S950 (index into machineChoices() below
+    // matches AkzMachine_S950's enum value, since choices are built in
+    // enum order) -- a reasonable flagship default, not load-bearing:
+    // the real record of "which machine" for a saved project is the
+    // stableId attribute getStateInformation adds, not this index.
+    layout.add(std::make_unique<juce::AudioParameterChoice>(
+        kMachineParamId, "Machine", machineChoices(), static_cast<int>(AkzMachine_S950)));
+
+    // 0 = machine's own native bit depth -- see AkaizerCore.h's
+    // AkzRealtimeChannelParams.bitDepth doc.
+    layout.add(std::make_unique<juce::AudioParameterInt>(
+        kBitDepthParamId, "Bit Depth", 0, 24, 0));
+
+    // Absolute Hz, deliberately NOT scoped to any one machine's own
+    // [min,max] -- akz_realtime_channel_process resolves/clamps this
+    // into whichever machine is currently selected (RateModel.h's
+    // resolveSampleRateHz), so one fixed control range works for every
+    // machine without the parameter itself needing to change shape when
+    // the machine does. A no-op on a fixed-rate machine (see
+    // MachineControls.h's machineHasBandwidthControl -- the editor
+    // hides this control there, but leaving the parameter live and
+    // harmless is simpler than disabling automation on it).
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        kBandwidthParamId, "Bandwidth",
+        juce::NormalisableRange<float>(1000.0f, 48000.0f, 1.0f, 0.35f), // skewed so the musically dense low end isn't cramped
+        44100.0f));
+
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        kCutoffParamId, "Cutoff", juce::NormalisableRange<float>(0.0f, 1.0f), 1.0f));
+
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        kResonanceParamId, "Resonance", juce::NormalisableRange<float>(0.0f, 1.0f), 0.0f));
+
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        kMixParamId, "Mix", juce::NormalisableRange<float>(0.0f, 1.0f), 1.0f));
+
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        kOutputParamId, "Output", juce::NormalisableRange<float>(-24.0f, 24.0f), 0.0f));
+
+    return layout;
+}
+
+void PatinaFXAudioProcessor::_destroyChannels() {
+    for (auto* channel : _channels) {
+        akz_realtime_channel_destroy(channel);
+    }
+    _channels.clear();
+}
+
+void PatinaFXAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
+    _destroyChannels();
+    const int channelCount = juce::jmax(getTotalNumInputChannels(), getTotalNumOutputChannels(), 1);
+    _channels.reserve(static_cast<size_t>(channelCount));
+    for (int i = 0; i < channelCount; ++i) {
+        _channels.push_back(akz_realtime_channel_create(sampleRate, static_cast<size_t>(samplesPerBlock)));
+    }
+    _dryBuffer.setSize(channelCount, samplesPerBlock, false, false, true);
+}
+
+void PatinaFXAudioProcessor::releaseResources() {
+    _destroyChannels();
+}
+
+bool PatinaFXAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const {
+    const auto mainOut = layouts.getMainOutputChannelSet();
+    if (mainOut != juce::AudioChannelSet::mono() && mainOut != juce::AudioChannelSet::stereo()) {
+        return false;
+    }
+    return mainOut == layouts.getMainInputChannelSet();
+}
+
+AkzRealtimeChannelParams PatinaFXAudioProcessor::_currentParams() const {
+    AkzRealtimeChannelParams params{};
+    const int rawMachineIndex = static_cast<int>(apvts.getRawParameterValue(kMachineParamId)->load());
+    const int clampedIndex = juce::jlimit(0, static_cast<int>(akz_machine_count()) - 1, rawMachineIndex);
+    params.machine = static_cast<AkzMachine>(clampedIndex);
+    params.bitDepth = static_cast<int>(apvts.getRawParameterValue(kBitDepthParamId)->load());
+    params.sampleRateHz = apvts.getRawParameterValue(kBandwidthParamId)->load();
+    params.filterCutoff01 = apvts.getRawParameterValue(kCutoffParamId)->load();
+    params.filterResonance01 = apvts.getRawParameterValue(kResonanceParamId)->load();
+    return params;
+}
+
+void PatinaFXAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&) {
+    juce::ScopedNoDenormals noDenormals;
+
+    const int numSamples = buffer.getNumSamples();
+    const int numChannels = buffer.getNumChannels();
+    const AkzRealtimeChannelParams params = _currentParams();
+    const float mix = apvts.getRawParameterValue(kMixParamId)->load();
+    const bool needsDry = mix < 0.999f;
+
+    if (needsDry) {
+        _dryBuffer.setSize(numChannels, numSamples, false, false, true);
+        for (int ch = 0; ch < numChannels; ++ch) {
+            _dryBuffer.copyFrom(ch, 0, buffer, ch, 0, numSamples);
+        }
+    }
+
+    for (int ch = 0; ch < numChannels && ch < static_cast<int>(_channels.size()); ++ch) {
+        akz_realtime_channel_set_params(_channels[static_cast<size_t>(ch)], &params);
+        akz_realtime_channel_process(_channels[static_cast<size_t>(ch)], buffer.getWritePointer(ch), static_cast<size_t>(numSamples));
+    }
+
+    const float outputGain = juce::Decibels::decibelsToGain(apvts.getRawParameterValue(kOutputParamId)->load());
+
+    for (int ch = 0; ch < numChannels; ++ch) {
+        float* wet = buffer.getWritePointer(ch);
+        if (needsDry) {
+            const float* dry = _dryBuffer.getReadPointer(ch);
+            for (int i = 0; i < numSamples; ++i) {
+                wet[i] = (wet[i] * mix + dry[i] * (1.0f - mix)) * outputGain;
+            }
+        } else {
+            for (int i = 0; i < numSamples; ++i) {
+                wet[i] *= outputGain;
+            }
+        }
+    }
+}
+
+juce::AudioProcessorEditor* PatinaFXAudioProcessor::createEditor() {
+    return new PatinaFXAudioProcessorEditor(*this);
+}
+
+void PatinaFXAudioProcessor::getStateInformation(juce::MemoryBlock& destData) {
+    auto state = apvts.copyState();
+    std::unique_ptr<juce::XmlElement> xml(state.createXml());
+
+    // The machine's stableId, ADDITIONALLY to the choice parameter's own
+    // raw index the APVTS XML already stores -- see PresetStore.swift's
+    // rule (a preset's machine survives AkzMachine being reordered
+    // because it's keyed by stableId, never by enum value) and
+    // machineForStableId's use in setStateInformation below.
+    const int machineIndex = static_cast<int>(apvts.getRawParameterValue(kMachineParamId)->load());
+    const int clampedIndex = juce::jlimit(0, static_cast<int>(akz_machine_count()) - 1, machineIndex);
+    xml->setAttribute("machineStableId", stableIdForMachine(static_cast<AkzMachine>(clampedIndex)));
+
+    copyXmlToBinary(*xml, destData);
+}
+
+void PatinaFXAudioProcessor::setStateInformation(const void* data, int sizeInBytes) {
+    std::unique_ptr<juce::XmlElement> xml(getXmlFromBinary(data, sizeInBytes));
+    if (xml == nullptr || !xml->hasTagName(apvts.state.getType())) {
+        return;
+    }
+
+    apvts.replaceState(juce::ValueTree::fromXml(*xml));
+
+    if (xml->hasAttribute("machineStableId")) {
+        const AkzMachine resolved = machineForStableId(xml->getStringAttribute("machineStableId"));
+        if (auto* choiceParam = dynamic_cast<juce::AudioParameterChoice*>(apvts.getParameter(kMachineParamId))) {
+            *choiceParam = static_cast<int>(resolved);
+        }
+    }
+}
+
+// This creates the plugin's audio processor. See:
+// https://docs.juce.com/master/tutorial_audio_processor.html
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter() {
+    return new PatinaFXAudioProcessor();
+}
