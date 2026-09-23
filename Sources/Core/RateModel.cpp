@@ -1,51 +1,22 @@
 // RateModel.cpp
 //
-// See RateModel.h for the record-path rationale.
+// See RateModel.h for the record-path rationale. OnePoleLPF and
+// converterSpecForMachine used to be defined here (anonymous namespace);
+// they now live in RateStages.h so Sources/Core/RealtimeChannel.h can
+// reuse them with persistent state across calls. This file's own
+// behaviour is unchanged -- see Tests/CoreTests/RateModelTests.cpp.
 
 #include "RateModel.h"
 #include "ConverterModel.h"
 #include "MachineProfile.h"
+#include "RateStages.h"
 
 #include <algorithm>
-#include <cmath>
 #include <vector>
 
 namespace akz {
 
 namespace {
-
-// Deliberately a separate, file-local copy of FilterModel.cpp's
-// OnePoleLowpassCascade rather than a shared header: that class lives in
-// FilterModel.cpp's anonymous namespace (not exported), and the two
-// serve genuinely different roles that happen to share an
-// implementation shape -- one is the machine's OUTPUT reconstruction
-// filter (post-DAC, in the main signal chain), this one is the ADC-side
-// anti-alias filter that runs only inside applyRecordPath, before
-// decimation. Extracting a shared class for ~15 lines used by exactly
-// two call sites would cost a new header for a saving this small.
-class OnePoleLPF {
-public:
-    OnePoleLPF(int poles, double cutoffHz, double sampleRateHz)
-        : _poles(std::max(1, poles)) {
-        const double clampedCutoff = std::min(cutoffHz, sampleRateHz * 0.49);
-        _a = 1.0 - std::exp(-2.0 * M_PI * clampedCutoff / sampleRateHz);
-        _state.assign(static_cast<size_t>(_poles), 0.0);
-    }
-
-    float process(float x) {
-        double v = static_cast<double>(x);
-        for (int i = 0; i < _poles; ++i) {
-            _state[static_cast<size_t>(i)] += _a * (v - _state[static_cast<size_t>(i)]);
-            v = _state[static_cast<size_t>(i)];
-        }
-        return static_cast<float>(v);
-    }
-
-private:
-    int _poles;
-    double _a;
-    std::vector<double> _state;
-};
 
 // Shared by applyRecordPath's decimation step and applyDacPath: true
 // decimation to targetRateHz followed by zero-order-hold reconstruction
@@ -70,21 +41,6 @@ void holdAtRate(float* buffer, size_t count, double targetRateHz, double hostSam
         }
         buffer[i] = held;
     }
-}
-
-// Builds the converter spec applyRecordPath quantises with, from the
-// profile's plain capability fields -- ConverterModel.h stays exactly
-// as machine-unaware as it was pre-v2; this is the one place an
-// AkzMachine's converter character crosses into a ConverterSpec.
-// profile.companded is a bool-ish int (v1's shape, unchanged): today it
-// means MuLaw when set, since that is the only companding law any
-// researched heritage machine (the Emulator II) needs -- see
-// ConverterModel.h's Companding doc comment.
-ConverterSpec converterSpecForMachine(const AkzMachineProfile& profile) {
-    ConverterSpec spec;
-    spec.bits = profile.bitDepth;
-    spec.companding = profile.companded ? Companding::MuLaw : Companding::None;
-    return spec;
 }
 
 } // namespace

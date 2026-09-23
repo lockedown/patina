@@ -17,10 +17,14 @@ add_library(AkaizerCore STATIC
     Interpolator.cpp
     ConverterModel.h
     ConverterModel.cpp
+    FilterStages.h
     FilterModel.h
     FilterModel.cpp
+    RateStages.h
     RateModel.h
     RateModel.cpp
+    RealtimeChannel.h
+    RealtimeChannel.cpp
 )
 
 find_package(Threads REQUIRED)

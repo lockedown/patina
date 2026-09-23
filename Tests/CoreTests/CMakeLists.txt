@@ -14,6 +14,7 @@ add_executable(AkaizerCoreTests
     FilterModelTests.cpp
     IntelligentModeTests.cpp
     RateModelTests.cpp
+    RealtimeChannelTests.cpp
 )
 
 target_link_libraries(AkaizerCoreTests PRIVATE AkaizerCore)

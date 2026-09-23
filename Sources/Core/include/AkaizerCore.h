@@ -463,6 +463,79 @@ int akz_realtime_player_is_recomputing(const AkzRealtimePlayer* player);
 // channel's player also being ready, and commit all of them together.
 void akz_realtime_player_commit_pending(AkzRealtimePlayer* player);
 
+// ---------------------------------------------------------------------------
+// Real-time channel — block-streaming insert-effect signal path
+// ---------------------------------------------------------------------------
+//
+// AkzRealtimePlayer above (and AkzStretchEngine before it) both assume a
+// whole sample is known in advance: something is loaded, then played
+// back or looped. AkzRealtimeChannel is for the opposite situation --
+// VstPlugin, a DAW insert effect with no "sample" at all, just whatever
+// audio the host hands it next, forever. It runs the SAME per-machine
+// rate/converter/filter character, minus time-stretch and transpose
+// (see Sources/Core/RealtimeChannel.h for why both are structurally
+// incompatible with not knowing the future of the audio stream), and its
+// parameters are ordinary live knobs -- not something that needs a
+// background-thread recompute or a cross-channel commit gate the way a
+// length-changing stretch re-render does, because nothing here ever
+// changes how many samples come out for how many go in.
+//
+// One AkzRealtimeChannel processes one audio channel (mono). A stereo
+// plugin owns two and MUST call akz_realtime_channel_set_params with the
+// identical params on both in the same host callback, so L and R never
+// see a different machine/cutoff/bit-depth mid-stream -- same class of
+// bug the offline/live-audition stereo paths already had to solve (see
+// LiveAuditionController.swift's commit-gate comment), avoided here by
+// simply never letting it arise: both channels are driven from the same
+// caller-owned params struct, not two independent per-channel workers.
+
+typedef struct AkzRealtimeChannelParams {
+    AkzMachine machine;
+
+    // <= 0 means "use machine's own native bit depth" (profile.bitDepth
+    // -- 12 for S900/S950, etc.). A positive value overrides it, letting
+    // the live "Bit Depth" control dial anywhere from 1-24 regardless of
+    // which machine is selected -- companding (Emulator II's mu-law) is
+    // still taken from the machine profile either way; only the linear
+    // quantisation step count is overridden.
+    int bitDepth;
+
+    // Sample-rate/bandwidth front end -- same semantics as
+    // AkzStretchParams.sampleRateHz (AkaizerCore.h): 0 = machine's own
+    // default, a positive value is clamped into
+    // [profile.minSampleRateHz, profile.maxSampleRateHz]. Only
+    // meaningful (as a live-adjustable control) on a machine with
+    // hasVariableSampleRate != 0; harmless to set on any other machine,
+    // where it just clamps to that machine's single effective rate.
+    float sampleRateHz;
+
+    // Same 0..1 logarithmic-to-Hz mapping and 0..1 resonance-code
+    // mapping as AkzStretchParams -- see FilterModel.h. resonance01 is
+    // ignored on machines without filterHasResonance.
+    float filterCutoff01;
+    float filterResonance01;
+} AkzRealtimeChannelParams;
+
+typedef struct AkzRealtimeChannel AkzRealtimeChannel;
+
+// hostSampleRateHz/maxBlockFrames come from the host's prepareToPlay-
+// style callback. Ownership passes to the caller; free with
+// akz_realtime_channel_destroy().
+AkzRealtimeChannel* akz_realtime_channel_create(double hostSampleRateHz, size_t maxBlockFrames);
+void                akz_realtime_channel_destroy(AkzRealtimeChannel* channel);
+
+// Any thread. Never allocates, never blocks the audio thread waiting on
+// process() -- see RealtimeChannel.h's header comment.
+void akz_realtime_channel_set_params(AkzRealtimeChannel* channel, const AkzRealtimeChannelParams* params);
+
+// Audio thread only. Re-homes filter memory and rate-stage phase --
+// call on transport stop/restart, NOT on an ordinary parameter move.
+void akz_realtime_channel_reset(AkzRealtimeChannel* channel);
+
+// Audio thread only. Never allocates. Exactly `frames` samples
+// processed in place.
+void akz_realtime_channel_process(AkzRealtimeChannel* channel, float* inout, size_t frames);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
