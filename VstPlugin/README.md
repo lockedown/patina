@@ -90,11 +90,9 @@ configure, which needs network access. To build on a machine with none:
    cmake --build VstPlugin\build --config Release
    ```
 
-This plugin has **not** been built or run on actual Windows 11 — only
-on macOS, where the same CMake project also produces VST3/AU/Standalone
-builds for local development. Before shipping:
+Built and run successfully on both macOS and Windows 11 (VS 2022). Not
+yet done, before shipping:
 
-- Build on Windows 11 with VS 2022.
 - Run [pluginval](https://github.com/Tracktion/pluginval) at strictness
   level 8+ against the built VST3 (covers threading, automation, state
   round-trip, and odd buffer sizes).
