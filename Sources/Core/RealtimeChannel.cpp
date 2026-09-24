@@ -62,6 +62,10 @@ RealtimeChannel::MachineChain::MachineChain(AkzMachine m, double hostRate)
 }
 
 void RealtimeChannel::MachineChain::configureRate(float requestedSampleRateHz, double hostRate) {
+    if (requestedSampleRateHz == configuredRequestHz) {
+        return; // identical request -> identical effectiveRate/AA cutoff/hold spacing; nothing to recompute
+    }
+    configuredRequestHz = requestedSampleRateHz;
     effectiveRateHz = resolveSampleRateHz(machine, requestedSampleRateHz, hostRate);
     // Holds are identity at effectiveRateHz >= hostRate (see .h) -- the
     // gate is an optimisation, not a bypass. The AA filter is retuned
@@ -78,6 +82,11 @@ void RealtimeChannel::MachineChain::retuneFilter(double cutoffHz, int resonanceC
     // profile.filterTracksPitch never scales cutoffHz here the way
     // applyFilter's whole-buffer version does; the caller (process())
     // already passes a cutoffHz with no pitch-tracking multiplier.
+    if (cutoffHz == lastCutoffHz && resonanceCode == lastResonanceCode) {
+        return; // smoother converged / knob idle -> coefficients already correct; skip the transcendental recompute
+    }
+    lastCutoffHz = cutoffHz;
+    lastResonanceCode = resonanceCode;
     for (auto& stage : filterStages) {
         stage->retune(cutoffHz, resonanceCode);
     }
@@ -89,9 +98,7 @@ void RealtimeChannel::MachineChain::processBlock(float* buf, size_t count, int b
     // at or above the host's (a machine re-clocking a host-rate stream
     // still hears its own input filter; only the decimate/hold stages
     // collapse to identity there). Matches applyRecordPath.
-    for (size_t i = 0; i < count; ++i) {
-        buf[i] = aaFilter.process(buf[i]);
-    }
+    aaFilter.processBlock(buf, count);
     if (holdStagesActive) {
         recordHold.process(buf, count);
     }
@@ -109,12 +116,8 @@ void RealtimeChannel::MachineChain::processBlock(float* buf, size_t count, int b
         dacHold.process(buf, count);
     }
 
-    for (size_t i = 0; i < count; ++i) {
-        float v = buf[i];
-        for (auto& stage : filterStages) {
-            v = stage->process(v);
-        }
-        buf[i] = v;
+    for (auto& stage : filterStages) {
+        stage->processBlock(buf, count);
     }
 }
 
@@ -128,7 +131,8 @@ void RealtimeChannel::MachineChain::reset() {
 }
 
 RealtimeChannel::RealtimeChannel(double hostSampleRateHz, size_t maxBlockFrames)
-    : _hostSampleRateHz(hostSampleRateHz) {
+    : _hostSampleRateHz(hostSampleRateHz),
+      _smoothingCoeff(smoothingCoefficientFor(hostSampleRateHz)) {
     // maxBlockFrames isn't needed internally -- the crossfade scratch
     // buffer is fixed at kControlIntervalFrames regardless of host block
     // size (see process()'s chunking). Kept as a constructor parameter
@@ -203,7 +207,7 @@ void RealtimeChannel::process(float* inout, size_t frames) {
         _machineSwapPending = false;
     }
 
-    const double smoothingCoeff = smoothingCoefficientFor(_hostSampleRateHz);
+    const double smoothingCoeff = _smoothingCoeff;
 
     size_t offset = 0;
     while (offset < frames) {

@@ -88,11 +88,16 @@ private:
         // record hold/DAC hold to it -- phase-preserving (see
         // RateStages.h's StreamingHold), so this is safe to call every
         // block regardless of whether the request actually changed.
+        // Early-returns when the request is identical to the last one
+        // applied (the common idle-knob case), so the recompute is only
+        // paid when the rate genuinely moves.
         void configureRate(float requestedSampleRateHz, double hostSampleRateHz);
 
         // Recomputes every filter stage's coefficients in place --
         // state-preserving (see FilterStages.h), safe to call every
-        // control-rate tick.
+        // control-rate tick. Early-returns when both inputs match the
+        // last-applied values (smoother converged / knob idle), so the
+        // per-stage transcendental recompute is only paid on real moves.
         void retuneFilter(double cutoffHz, int resonanceCode);
 
         // Runs the whole chain over `count` in-place samples.
@@ -121,6 +126,13 @@ private:
         StreamingHold recordHold;
         StreamingHold dacHold;
         std::vector<std::unique_ptr<IFilterStage>> filterStages;
+
+        // Last-applied configureRate/retuneFilter inputs, backing those
+        // methods' skip-when-unchanged guards. Sentinels force the first
+        // call after construction to always apply.
+        float configuredRequestHz = -1.0f;
+        double lastCutoffHz = -1.0;
+        int lastResonanceCode = -1;
     };
 
     void _applyPendingParamsIfAny();
@@ -151,7 +163,11 @@ private:
     bool _machineSwapPending = false; // set when pending params carry a different machine than _current
 
     // Control-rate cutoff/resonance smoothing -- see .cpp for the
-    // per-sample one-pole smoother and the retune cadence.
+    // per-sample one-pole smoother and the retune cadence. The
+    // coefficient is fixed at construction (host rate never changes
+    // for the life of this object) rather than recomputed per process()
+    // call.
+    const double _smoothingCoeff;
     float _smoothedCutoff01 = 1.0f;
     float _smoothedResonance01 = 0.0f;
 

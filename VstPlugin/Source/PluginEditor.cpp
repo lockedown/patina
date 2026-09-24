@@ -92,8 +92,10 @@ void PatinaFXAudioProcessorEditor::timerCallback() {
 
 void PatinaFXAudioProcessorEditor::_updateVisibilityAndReadout() {
     const int machineIndex = juce::jlimit(0, static_cast<int>(akz_machine_count()) - 1, _machineBox.getSelectedItemIndex());
-    if (machineIndex == _lastDisplayedMachineIndex) return;
+    const int bitDepth = static_cast<int>(_processor.apvts.getRawParameterValue("bitDepth")->load());
+    if (machineIndex == _lastDisplayedMachineIndex && bitDepth == _lastDisplayedBitDepth) return;
     _lastDisplayedMachineIndex = machineIndex;
+    _lastDisplayedBitDepth = bitDepth;
 
     const AkzMachine machine = static_cast<AkzMachine>(machineIndex);
     const AkzMachineProfile* profile = akz_machine_profile(machine);
@@ -106,9 +108,29 @@ void PatinaFXAudioProcessorEditor::_updateVisibilityAndReadout() {
     _resonanceSlider.setVisible(showResonance);
     _resonanceLabel.setVisible(showResonance);
 
+    // Effective bit depth, not just the knob's raw value: the core caps
+    // any positive override AT the machine's native depth (a crusher,
+    // not an upgrade), so "24 bit" selected on a 12-bit machine really
+    // means 12 -- show the resolved figure so the cap is legible rather
+    // than surprising.
+    const int effectiveBits = bitDepth > 0 ? std::min(bitDepth, profile->bitDepth) : profile->bitDepth;
+    const juce::String bitText = juce::String(effectiveBits) + "-bit"
+        + (bitDepth > 0 && bitDepth < profile->bitDepth ? " crushed" : " native");
+
+    // Dual-fixed-rate machines (S1000/S2000/S3000/S3200) snap the
+    // bandwidth knob to their two real rates -- name them so the snap
+    // is visible rather than felt as dead travel.
+    const bool dualRate = profile->hasVariableSampleRate == 0
+        && profile->minSampleRateHz < profile->maxSampleRateHz;
+    const juce::String rateText = dualRate
+        ? juce::String(profile->minSampleRateHz, 0) + "/" + juce::String(profile->maxSampleRateHz, 0) + " Hz"
+        : juce::String(profile->maxSampleRateHz, 0) + " Hz";
+    _bandwidthSlider.setTooltip(dualRate
+        ? "This machine has two fixed rates -- the knob snaps to the nearer one."
+        : "");
+
     _readoutLabel.setText(
         juce::String(profile->name) + "  ·  " + juce::String(profile->yearIntroduced)
-            + "  ·  " + juce::String(profile->bitDepth) + "-bit native  ·  "
-            + juce::String(profile->maxSampleRateHz, 0) + " Hz",
+            + "  ·  " + bitText + "  ·  " + rateText,
         juce::dontSendNotification);
 }

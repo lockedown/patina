@@ -154,6 +154,13 @@ private:
     std::atomic<size_t> _crossfadeRemaining{0};
     size_t _crossfadeLength = 0;
 
+    // Equal-power fade gains indexed by remaining count (0.._crossfade-
+    // Length), built once at construction -- pull() indexes these
+    // instead of paying two sqrt() per faded sample. See .cpp's
+    // constructor for the bit-identical derivation.
+    std::vector<float> _fadeOldGain;
+    std::vector<float> _fadeNewGain;
+
     // Worker -> render-thread handoff, held here rather than published
     // directly -- see commitPending()'s comment above for why. The
     // filter-only cheap path used to skip this and publish straight to

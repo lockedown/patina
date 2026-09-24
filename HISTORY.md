@@ -52,12 +52,12 @@ Everything below is a deliberate scope decision flagged at the time, not an over
 - ~~The resonant SVF can't reach its own advertised range.~~ **Fixed in v2's TPT SVF migration** (stage 6) — see the v2 section below.
 - **The S1000's interpolator order is an assumption, not a citation.** Akai's own manual only states "24-bit algorithm, custom VLSI" (arithmetic precision, not filter order); this project assumes linear interpolation pending a by-ear revision (`Interpolator.h`).
 - ~~The waveform display is not scrubable.~~ **Fixed in 2.1** (`WaveformView.swift`/`WaveformGeometry.swift`) — see the 2.1 section below.
-- **8-bit AIFF would decode with the wrong signedness.** `PCMConversion.swift` decodes 8-bit as unsigned (the WAV convention); AIFF's 8-bit is actually signed. Not fixed because it hasn't come up — real sample libraries are practically always 16-bit.
+- ~~8-bit AIFF would decode with the wrong signedness.~~ **Fixed in 2.6** — `WavFormat.is8BitSigned` carries the container's convention through `PCMConversion`, and cross-container saves flip the sign bias (`AudioFileService.swift`).
 - **INTELLIGENT mode's quality→search-range and width→crossfade mappings are this project's own design**, not derived from the hardware (no manual states the actual numeric ranges — plan section 2.2). The algorithm class (SOLA/cross-correlation search) is manual-confirmed; the specific curve mapping the 0–99 controls to sample counts is not. Measured too narrow at low `quality` (±33 samples against a 1323-sample frame at `quality=10`, not enough to phase-align even a 440 Hz tone) — a re-derive is in the backlog.
 - ~~S3000/S3200 clip at fully-open cutoff.~~ **Fixed in v2's TPT SVF migration** (stage 6) — see the v2 section below.
 - ~~Save Processed saves the last offline `Process()` result, not what live audition is currently playing.~~ **Fixed in v2 stage 11** — see the v2 section below (`Save Preview…`).
 - ~~Recent files are session-only~~, not persisted. **Fixed in v2 stage 1** (`RecentFilesStore.swift`).
-- **`_renderIsStale` can over-report staleness after 2.4's carry-over.** A parked-then-clamped value can make it flag a re-render as stale even when the audio would come out byte-identical (see the 2.4 section). Fixes with an `effective(for:)` projection that zeroes params the current machine ignores before comparing; not built yet.
+- ~~**`_renderIsStale` can over-report staleness after 2.4's carry-over.**~~ **Fixed in 2.6** — `ParamSnapshot.effective()` normalises every field the engine provably ignores for the current machine/mode, and `_renderIsStale` compares those projections instead of raw snapshots.
 
 ## v2 — heritage sampler roster (in progress)
 
@@ -140,6 +140,31 @@ First real-use feedback on the Patina FX VST3 (`VstPlugin/`), three reported iss
 5. **Found in review -- Bandwidth param defaults.** Default was a hardcoded 44100 Hz (arbitrary, host-rate-dependent character); now 48000, resolving to each machine's own `maxSampleRateHz` like `akz_stretch_params_default`. Range tightened 1000-48000 -> 7000-48000, removing dead travel below every machine's minimum (Fairlight's 7040 is the floor).
 
 Verification: `AkaizerCoreTests` 122/122 (new cases: bit-depth-above-native clamps, AA filter runs at/above host rate, dual-rate mid-range snap; `record_path_at_host_rate_is_pure_quantisation_no_incidental_filtering` rewritten as `record_path_at_host_rate_still_applies_the_input_filter`, and `cyclic_at_100_percent...`'s reference chain updated to `applyRecordPath` since the input filter is no longer skippable). VST3 + Standalone both build clean.
+
+## 2.6 — code-review pass: efficiency, performance, features (shipped)
+
+A full review of the DSP core, plugin and app -- twenty-two items, grouped below. Full plan: `/Users/locked/.windsurf/plans/code-review-efficiency-performance-features-f0613e.md`.
+
+**Core (`Sources/Core/`):**
+
+1. **`holdAtRate` no longer allocates per call** (`RateModel.cpp`) -- the decimation hold buffer is filled in place instead of returned by value.
+2. **Hoisted `pow`/`log` constants out of the per-sample loop** (`ConverterModel.cpp`); cached the smoothing coefficient and skipped unchanged `retune`/`configureRate` calls (`RealtimeChannel`); `IFilterStage::processBlock` is now a real virtual so the per-sample dispatch is gone (`FilterStages.h`, `FilterModel`, `RealtimeChannel`).
+3. **Allocation/copy hygiene:** `std::move` on the pending source/guide handoff in the worker loop, `reserve` in `_synthesizeIntelligent`, `memcpy` for the block copy in `_synthesizeCyclicBlocks`, precomputed crossfade gains in `RealtimeStretchPlayer::pull`, fixed-size stage state arrays (`FilterStages.h`, `RateStages.h`), and a subsampled SOLA correlation search in `StretchEngine` (same argmax, a fraction of the multiply-accumulates).
+
+**Plugin (`VstPlugin/`):**
+
+4. **Audio-thread parameter reads no longer string-keyed.** `PluginProcessor` caches the `std::atomic<float>*` for every parameter at construction, skips `setParams` when nothing changed since the last block, and smooths Mix/Output with `juce::SmoothedValue` (~20 ms ramp) -- automation no longer zipper-noises.
+5. **AU format added** (`FORMATS` in `CMakeLists.txt`); the editor readout now shows the *effective* bit depth (`N-bit crushed`/`native`) and dual-fixed-rate machines display both snap rates with a tooltip explaining the knob's behaviour.
+
+**App (`Sources/`):**
+
+6. **Offline Process no longer blocks the UI** (`ContentView.swift`) -- the render runs in a detached `Task` behind an `isProcessing` flag. Decoded channels are cached once per sample load instead of re-decoding on every play/audition. The splice-guide recompute in `LiveAuditionController` is gated to INTELLIGENT mode and debounced ~120 ms, so knob drags don't queue a render per frame.
+7. **`PCMConversion` hot paths use Accelerate/vDSP** -- 16/32-bit int decode, 32/64-bit float decode, stereo deinterleave, 16-bit encode, `applyGain`. Every replacement is bit-identical to the scalar loop it replaced (power-of-two divisors, `vDSP_vfix16` truncates toward zero like `Int()`); 8/24-bit and `rms` stay scalar deliberately.
+8. **8-bit AIFF signedness fixed end-to-end** -- `WavFormat.is8BitSigned` (set by `AiffCodec`, cleared by `WavCodec`) drives signed decode/encode in `PCMConversion`, and `AudioFileService` flips the sign bias (`^0x80`) on cross-container saves so a WAV->AIFF 8-bit export no longer gains a DC offset.
+9. **Waveform peaks memoised** (`WaveformView`) -- per-column min/max pairs are cached per (buffer, column count) instead of re-scanning the whole buffer on every Canvas invocation.
+10. **`_renderIsStale` compares `ParamSnapshot.effective()`** -- a projection that normalises params the engine provably ignores (parked bandwidth on a single-fixed-rate machine, resonance without a resonant filter, cycle in INTELLIGENT, stretch/engine on non-stretch machines). Moving an inert knob no longer marks the render stale; undo still uses raw `==`, since a parked-knob move is still a real edit.
+
+Verification: `AkaizerCoreTests` 122/122, `swift test` 89/89, VST3 + AU + Standalone all build clean.
 
 ## Project Structure
 

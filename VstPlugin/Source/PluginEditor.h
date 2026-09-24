@@ -53,6 +53,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> _outputAttachment;
 
     int _lastDisplayedMachineIndex = -1;
+    int _lastDisplayedBitDepth = -1; // readout shows the resolved depth, so it must refresh on bit-depth changes too
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(PatinaFXAudioProcessorEditor)
 };

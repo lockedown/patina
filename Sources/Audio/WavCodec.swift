@@ -33,6 +33,21 @@ public struct WavFormat: Equatable {
     public let channelCount: Int
     public let bitsPerSample: Int
     public let isFloat: Bool
+    /// 8-bit PCM signedness: WAV stores 8-bit unsigned, AIFF stores it
+    /// signed -- the one place the two containers genuinely differ in
+    /// sample encoding, not just byte order. Only meaningful when
+    /// bitsPerSample == 8 && !isFloat; describes how rawData is encoded
+    /// and how PCMConversion should interpret it. Defaulted so existing
+    /// constructions (all WAV, all >= 16-bit) need no change.
+    public let is8BitSigned: Bool
+
+    public init(sampleRate: Double, channelCount: Int, bitsPerSample: Int, isFloat: Bool, is8BitSigned: Bool = false) {
+        self.sampleRate = sampleRate
+        self.channelCount = channelCount
+        self.bitsPerSample = bitsPerSample
+        self.isFloat = isFloat
+        self.is8BitSigned = is8BitSigned
+    }
 }
 
 public struct WavFile {

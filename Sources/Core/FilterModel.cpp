@@ -40,12 +40,8 @@ void applyFilter(float* buffer, size_t count, AkzMachine machine, float cutoff01
         stages.push_back(makeFilterStage(profile.filterTopology, cutoffHz, resonanceCode, sampleRateHz, poles, profile.filterResonanceCompensation01));
     }
 
-    for (size_t i = 0; i < count; ++i) {
-        float v = buffer[i];
-        for (auto& stage : stages) {
-            v = stage->process(v);
-        }
-        buffer[i] = v;
+    for (auto& stage : stages) {
+        stage->processBlock(buffer, count);
     }
 }
 

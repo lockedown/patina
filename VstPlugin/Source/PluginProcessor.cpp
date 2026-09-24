@@ -46,6 +46,16 @@ PatinaFXAudioProcessor::PatinaFXAudioProcessor()
           .withInput("Input", juce::AudioChannelSet::stereo(), true)
           .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
       apvts(*this, nullptr, "PARAMETERS", _createParameterLayout()) {
+    // Cache the atomic pointers once -- see .h. getRawParameterValue()
+    // is a string-keyed map lookup; doing it per processBlock() is the
+    // classic JUCE audio-thread waste.
+    _machineParam = apvts.getRawParameterValue(kMachineParamId);
+    _bitDepthParam = apvts.getRawParameterValue(kBitDepthParamId);
+    _bandwidthParam = apvts.getRawParameterValue(kBandwidthParamId);
+    _cutoffParam = apvts.getRawParameterValue(kCutoffParamId);
+    _resonanceParam = apvts.getRawParameterValue(kResonanceParamId);
+    _mixParam = apvts.getRawParameterValue(kMixParamId);
+    _outputParam = apvts.getRawParameterValue(kOutputParamId);
 }
 
 PatinaFXAudioProcessor::~PatinaFXAudioProcessor() {
@@ -137,6 +147,14 @@ void PatinaFXAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBloc
         _channels.push_back(akz_realtime_channel_create(sampleRate, static_cast<size_t>(samplesPerBlock)));
     }
     _dryBuffer.setSize(channelCount, samplesPerBlock, false, false, true);
+
+    // ~20ms ramps, matching the core's own control smoothing feel.
+    // Snap to the current values so playback starts un-ramped.
+    _mixSmoothed.reset(sampleRate, 0.02);
+    _outputGainSmoothed.reset(sampleRate, 0.02);
+    _mixSmoothed.setCurrentAndTargetValue(_mixParam->load());
+    _outputGainSmoothed.setCurrentAndTargetValue(juce::Decibels::decibelsToGain(_outputParam->load()));
+    _hasSentParams = false; // channels were just rebuilt -- first processBlock must push params regardless
 }
 
 void PatinaFXAudioProcessor::releaseResources() {
@@ -153,13 +171,13 @@ bool PatinaFXAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) 
 
 AkzRealtimeChannelParams PatinaFXAudioProcessor::_currentParams() const {
     AkzRealtimeChannelParams params{};
-    const int rawMachineIndex = static_cast<int>(apvts.getRawParameterValue(kMachineParamId)->load());
+    const int rawMachineIndex = static_cast<int>(_machineParam->load());
     const int clampedIndex = juce::jlimit(0, static_cast<int>(akz_machine_count()) - 1, rawMachineIndex);
     params.machine = static_cast<AkzMachine>(clampedIndex);
-    params.bitDepth = static_cast<int>(apvts.getRawParameterValue(kBitDepthParamId)->load());
-    params.sampleRateHz = apvts.getRawParameterValue(kBandwidthParamId)->load();
-    params.filterCutoff01 = apvts.getRawParameterValue(kCutoffParamId)->load();
-    params.filterResonance01 = apvts.getRawParameterValue(kResonanceParamId)->load();
+    params.bitDepth = static_cast<int>(_bitDepthParam->load());
+    params.sampleRateHz = _bandwidthParam->load();
+    params.filterCutoff01 = _cutoffParam->load();
+    params.filterResonance01 = _resonanceParam->load();
     return params;
 }
 
@@ -169,8 +187,23 @@ void PatinaFXAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce
     const int numSamples = buffer.getNumSamples();
     const int numChannels = buffer.getNumChannels();
     const AkzRealtimeChannelParams params = _currentParams();
-    const float mix = apvts.getRawParameterValue(kMixParamId)->load();
-    const bool needsDry = mix < 0.999f;
+
+    // Push params only when they actually changed -- setParams takes a
+    // mutex + copies a POD per channel, which is pointless work on the
+    // (overwhelmingly common) block where every knob is idle.
+    const bool paramsChanged = !_hasSentParams
+        || params.machine != _lastSentParams.machine
+        || params.bitDepth != _lastSentParams.bitDepth
+        || params.sampleRateHz != _lastSentParams.sampleRateHz
+        || params.filterCutoff01 != _lastSentParams.filterCutoff01
+        || params.filterResonance01 != _lastSentParams.filterResonance01;
+
+    _mixSmoothed.setTargetValue(_mixParam->load());
+    _outputGainSmoothed.setTargetValue(juce::Decibels::decibelsToGain(_outputParam->load()));
+
+    // needsDry tracks the ramp's ENDPOINT, not its current value: a mix
+    // ramping 1 -> 0 still needs the dry copy for the whole descent.
+    const bool needsDry = _mixParam->load() < 0.999f || _mixSmoothed.getCurrentValue() < 0.999f;
 
     if (needsDry) {
         _dryBuffer.setSize(numChannels, numSamples, false, false, true);
@@ -180,23 +213,28 @@ void PatinaFXAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce
     }
 
     for (int ch = 0; ch < numChannels && ch < static_cast<int>(_channels.size()); ++ch) {
-        akz_realtime_channel_set_params(_channels[static_cast<size_t>(ch)], &params);
+        if (paramsChanged) {
+            akz_realtime_channel_set_params(_channels[static_cast<size_t>(ch)], &params);
+        }
         akz_realtime_channel_process(_channels[static_cast<size_t>(ch)], buffer.getWritePointer(ch), static_cast<size_t>(numSamples));
     }
-
-    const float outputGain = juce::Decibels::decibelsToGain(apvts.getRawParameterValue(kOutputParamId)->load());
+    _lastSentParams = params;
+    _hasSentParams = true;
 
     for (int ch = 0; ch < numChannels; ++ch) {
         float* wet = buffer.getWritePointer(ch);
         if (needsDry) {
             const float* dry = _dryBuffer.getReadPointer(ch);
             for (int i = 0; i < numSamples; ++i) {
+                const float mix = _mixSmoothed.getNextValue();
+                const float outputGain = _outputGainSmoothed.getNextValue();
                 wet[i] = (wet[i] * mix + dry[i] * (1.0f - mix)) * outputGain;
             }
         } else {
             for (int i = 0; i < numSamples; ++i) {
-                wet[i] *= outputGain;
+                wet[i] *= _outputGainSmoothed.getNextValue();
             }
+            _mixSmoothed.skip(numSamples); // keep the ramp in step with the output gain's
         }
     }
 }

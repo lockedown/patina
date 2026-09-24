@@ -89,7 +89,9 @@ public enum AiffCodec {
         }
         guard let soundDataBigEndian else { throw AiffCodecError.missingSsndChunk(url) }
 
-        let format = WavFormat(sampleRate: sampleRate, channelCount: channelCount, bitsPerSample: bitsPerSample, isFloat: false)
+        // AIFF 8-bit PCM is signed (WAV's is unsigned) -- the flag rides
+        // the format so PCMConversion decodes it correctly.
+        let format = WavFormat(sampleRate: sampleRate, channelCount: channelCount, bitsPerSample: bitsPerSample, isFloat: false, is8BitSigned: true)
         let littleEndianData = _swapByteOrder(soundDataBigEndian, bitsPerSample: bitsPerSample)
         return WavFile(format: format, rawData: littleEndianData)
     }

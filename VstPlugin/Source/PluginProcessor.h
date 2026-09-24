@@ -67,5 +67,28 @@ private:
     std::vector<AkzRealtimeChannel*> _channels;
     juce::AudioBuffer<float> _dryBuffer;
 
+    // Cached APVTS atomic pointers -- getRawParameterValue() is a
+    // string-keyed map lookup, so it runs once here at construction
+    // rather than seven times per processBlock().
+    std::atomic<float>* _machineParam = nullptr;
+    std::atomic<float>* _bitDepthParam = nullptr;
+    std::atomic<float>* _bandwidthParam = nullptr;
+    std::atomic<float>* _cutoffParam = nullptr;
+    std::atomic<float>* _resonanceParam = nullptr;
+    std::atomic<float>* _mixParam = nullptr;
+    std::atomic<float>* _outputParam = nullptr;
+
+    // Last params actually pushed to the channels -- processBlock()
+    // skips the per-channel setParams mutex round-trip entirely when
+    // nothing changed (the common case: knobs idle).
+    AkzRealtimeChannelParams _lastSentParams{};
+    bool _hasSentParams = false;
+
+    // Per-sample ramps for Mix and Output -- applied per block they
+    // zipper-noise under host automation; ~20ms matches the core's own
+    // cutoff/resonance smoothing feel (RealtimeChannel.cpp).
+    juce::SmoothedValue<float> _mixSmoothed;
+    juce::SmoothedValue<float> _outputGainSmoothed;
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(PatinaFXAudioProcessor)
 };

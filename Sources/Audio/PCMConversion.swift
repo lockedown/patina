@@ -3,16 +3,17 @@
 // Converts between the raw PCM bytes WavCodec/AiffCodec deal in (see
 // their header comments for why this app avoids AVAudioFile/
 // AVAudioConverter for this) and the Float32 interleaved samples the DSP
-// core and AVAudioEngine both want. Hand-rolled, same reasoning as the
-// codecs: no framework in between, nothing to silently mis-round.
+// core and AVAudioEngine both want.
 //
-// Known limitation: 8-bit PCM is decoded as unsigned (the WAV
-// convention); AIFF's 8-bit is actually signed, so an 8-bit AIFF file
-// would decode wrong. Not fixed because it hasn't come up -- real sample
-// libraries are practically always 16-bit -- but flagged rather than
-// silently assumed correct. Fix by giving WavFormat a signedness flag
-// before relying on this for 8-bit AIFF.
+// The hot paths (16/32-bit decode, float decode, stereo deinterleave,
+// 16-bit encode, applyGain) use Accelerate/vDSP -- every one is
+// bit-identical to the scalar loops they replaced: the divisors are all
+// powers of two (exact), vDSP_vfix16 truncates toward zero exactly like
+// Int(), and the float paths are straight copies. Scalar loops remain
+// for 8/24-bit (no exact-fit vDSP primitive) and rms (which deliberately
+// accumulates in Double).
 
+import Accelerate
 import Foundation
 
 public enum PCMConversion {
@@ -20,6 +21,21 @@ public enum PCMConversion {
     public static func deinterleave(_ samples: [Float], channelCount: Int) -> [[Float]] {
         guard channelCount > 0 else { return [] }
         guard channelCount > 1 else { return [samples] }
+        if channelCount == 2 {
+            // The overwhelmingly common case -- two strided copies
+            // (vsmul by 1.0; vDSP_vmov isn't in the Swift overlay, and
+            // x*1.0 is bit-identical anyway).
+            let frameCount = samples.count / 2
+            var a = [Float](repeating: 0, count: frameCount)
+            var b = [Float](repeating: 0, count: frameCount)
+            var one = Float(1.0)
+            samples.withUnsafeBufferPointer { src in
+                guard let base = src.baseAddress else { return }
+                vDSP_vsmul(base, 2, &one, &a, 1, vDSP_Length(frameCount))
+                vDSP_vsmul(base + 1, 2, &one, &b, 1, vDSP_Length(frameCount))
+            }
+            return [a, b]
+        }
         var channels = [[Float]](repeating: [], count: channelCount)
         for ch in 0..<channelCount {
             channels[ch] = [Float](repeating: 0, count: samples.count / channelCount)
@@ -55,36 +71,53 @@ public enum PCMConversion {
         let sampleCount = rawData.count / bytesPerSample
         var out = [Float](repeating: 0, count: sampleCount)
 
-        rawData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            if format.isFloat {
-                switch format.bitsPerSample {
-                case 32:
-                    for i in 0..<sampleCount {
-                        out[i] = raw.loadUnaligned(fromByteOffset: i * 4, as: Float32.self)
-                    }
-                case 64:
-                    for i in 0..<sampleCount {
-                        out[i] = Float(raw.loadUnaligned(fromByteOffset: i * 8, as: Float64.self))
-                    }
-                default:
-                    break
-                }
-                return
-            }
-
+        if format.isFloat {
             switch format.bitsPerSample {
-            case 8:
-                // Unsigned, WAV convention -- see the AIFF caveat above.
-                for i in 0..<sampleCount {
-                    let byte = raw.load(fromByteOffset: i, as: UInt8.self)
-                    out[i] = (Float(byte) - 128.0) / 128.0
+            case 32:
+                // Native Float32 little-endian -- a straight copy.
+                _ = out.withUnsafeMutableBufferPointer { dst in
+                    rawData.prefix(sampleCount * 4).copyBytes(to: UnsafeMutableRawBufferPointer(dst))
                 }
-            case 16:
-                for i in 0..<sampleCount {
-                    let v = raw.loadUnaligned(fromByteOffset: i * 2, as: Int16.self)
-                    out[i] = Float(v) / 32768.0
+            case 64:
+                var tmp = [Double](repeating: 0, count: sampleCount)
+                _ = tmp.withUnsafeMutableBufferPointer { dst in
+                    rawData.prefix(sampleCount * 8).copyBytes(to: UnsafeMutableRawBufferPointer(dst))
                 }
-            case 24:
+                vDSP_vdpsp(&tmp, 1, &out, 1, vDSP_Length(sampleCount))
+            default:
+                break
+            }
+            return out
+        }
+
+        switch format.bitsPerSample {
+        case 8:
+            rawData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                if format.is8BitSigned {
+                    // AIFF convention -- see WavFormat.is8BitSigned.
+                    for i in 0..<sampleCount {
+                        out[i] = Float(Int8(bitPattern: raw.load(fromByteOffset: i, as: UInt8.self))) / 128.0
+                    }
+                } else {
+                    // Unsigned, WAV convention.
+                    for i in 0..<sampleCount {
+                        let byte = raw.load(fromByteOffset: i, as: UInt8.self)
+                        out[i] = (Float(byte) - 128.0) / 128.0
+                    }
+                }
+            }
+        case 16:
+            var tmp = [Int16](repeating: 0, count: sampleCount)
+            _ = tmp.withUnsafeMutableBufferPointer { dst in
+                rawData.prefix(sampleCount * 2).copyBytes(to: UnsafeMutableRawBufferPointer(dst))
+            }
+            var scale = Float(1.0 / 32768.0)
+            vDSP_vflt16(&tmp, 1, &out, 1, vDSP_Length(sampleCount))
+            out.withUnsafeMutableBufferPointer { buf in
+                vDSP_vsmul(buf.baseAddress!, 1, &scale, buf.baseAddress!, 1, vDSP_Length(sampleCount))
+            }
+        case 24:
+            rawData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                 for i in 0..<sampleCount {
                     let b0 = Int32(raw.load(fromByteOffset: i * 3, as: UInt8.self))
                     let b1 = Int32(raw.load(fromByteOffset: i * 3 + 1, as: UInt8.self))
@@ -93,14 +126,19 @@ public enum PCMConversion {
                     if v & 0x800000 != 0 { v |= ~0xFFFFFF } // sign-extend 24 -> 32
                     out[i] = Float(v) / 8388608.0
                 }
-            case 32:
-                for i in 0..<sampleCount {
-                    let v = raw.loadUnaligned(fromByteOffset: i * 4, as: Int32.self)
-                    out[i] = Float(v) / 2147483648.0
-                }
-            default:
-                break
             }
+        case 32:
+            var tmp = [Int32](repeating: 0, count: sampleCount)
+            _ = tmp.withUnsafeMutableBufferPointer { dst in
+                rawData.prefix(sampleCount * 4).copyBytes(to: UnsafeMutableRawBufferPointer(dst))
+            }
+            var scale = Float(1.0 / 2147483648.0)
+            vDSP_vflt32(&tmp, 1, &out, 1, vDSP_Length(sampleCount))
+            out.withUnsafeMutableBufferPointer { buf in
+                vDSP_vsmul(buf.baseAddress!, 1, &scale, buf.baseAddress!, 1, vDSP_Length(sampleCount))
+            }
+        default:
+            break
         }
         return out
     }
@@ -116,15 +154,11 @@ public enum PCMConversion {
         if format.isFloat {
             switch format.bitsPerSample {
             case 32:
-                for s in samples {
-                    var v = s
-                    withUnsafeBytes(of: &v) { out.append(contentsOf: $0) }
-                }
+                samples.withUnsafeBytes { out.append(contentsOf: $0) }
             case 64:
-                for s in samples {
-                    var v = Float64(s)
-                    withUnsafeBytes(of: &v) { out.append(contentsOf: $0) }
-                }
+                var tmp = [Double](repeating: 0, count: samples.count)
+                vDSP_vspdp(samples, 1, &tmp, 1, vDSP_Length(samples.count))
+                tmp.withUnsafeBytes { out.append(contentsOf: $0) }
             default:
                 break
             }
@@ -133,17 +167,37 @@ public enum PCMConversion {
 
         switch format.bitsPerSample {
         case 8:
-            for s in samples {
-                let clamped = max(-1.0, min(1.0, s))
-                let byte = UInt8(max(0, min(255, Int(clamped * 128.0 + 128.0))))
-                out.append(byte)
+            if format.is8BitSigned {
+                // AIFF convention -- see WavFormat.is8BitSigned.
+                for s in samples {
+                    let clamped = max(-1.0, min(1.0, s))
+                    let v = Int8(max(-128, min(127, Int(clamped * 128.0))))
+                    out.append(UInt8(bitPattern: v))
+                }
+            } else {
+                for s in samples {
+                    let clamped = max(-1.0, min(1.0, s))
+                    let byte = UInt8(max(0, min(255, Int(clamped * 128.0 + 128.0))))
+                    out.append(byte)
+                }
             }
         case 16:
-            for s in samples {
-                let clamped = max(-1.0, min(1.0, s))
-                var v = Int16(max(-32768, min(32767, Int(clamped * 32768.0))))
-                withUnsafeBytes(of: &v) { out.append(contentsOf: $0) }
+            // scale -> clip -> truncate-toward-zero, all vectorised.
+            // Equivalent to the scalar clamp-then-truncate: any value
+            // that would have clamped to [-1,1] first lands inside the
+            // [-32768,32767] clip anyway, and vDSP_vfix16 truncates
+            // toward zero exactly like Int().
+            var scaled = [Float](repeating: 0, count: samples.count)
+            var scale = Float(32768.0)
+            var lo = Float(-32768.0)
+            var hi = Float(32767.0)
+            vDSP_vsmul(samples, 1, &scale, &scaled, 1, vDSP_Length(samples.count))
+            scaled.withUnsafeMutableBufferPointer { buf in
+                vDSP_vclip(buf.baseAddress!, 1, &lo, &hi, buf.baseAddress!, 1, vDSP_Length(samples.count))
             }
+            var ints = [Int16](repeating: 0, count: samples.count)
+            vDSP_vfix16(&scaled, 1, &ints, 1, vDSP_Length(samples.count))
+            ints.withUnsafeBytes { out.append(contentsOf: $0) }
         case 24:
             for s in samples {
                 let clamped = max(-1.0, min(1.0, s))
@@ -197,6 +251,11 @@ public enum PCMConversion {
 
     public static func applyGain(_ channels: [[Float]], gain: Float) -> [[Float]] {
         guard gain != 1.0 else { return channels }
-        return channels.map { channel in channel.map { $0 * gain } }
+        var g = gain
+        return channels.map { channel in
+            var out = [Float](repeating: 0, count: channel.count)
+            vDSP_vsmul(channel, 1, &g, &out, 1, vDSP_Length(channel.count))
+            return out
+        }
     }
 }

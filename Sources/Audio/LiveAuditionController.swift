@@ -36,6 +36,12 @@ public final class LiveAuditionController {
     /// dropped instead of clobbering it with a stale guide.
     private var _guideRequestGeneration = 0
 
+    /// Pending debounced guide pass -- cancelled and rescheduled on
+    /// every call, so a knob drag (one setParams per tick) produces ONE
+    /// guide computation after the gesture settles rather than N full
+    /// renders that all run to completion and get discarded.
+    private var _guideDebounceItem: DispatchWorkItem?
+
     public init(channelCount: Int, sampleRateHz: Double) {
         self.sampleRateHz = sampleRateHz
         let players = (0..<max(1, channelCount)).map { _ in RealtimePlayer(sampleRateHz: sampleRateHz) }
@@ -143,10 +149,33 @@ public final class LiveAuditionController {
         guard let channels = lastChannels, let params = lastParams, channels.count > 1,
               let frameCount = channels.first?.count, frameCount > 0 else { return }
 
+        // Only INTELLIGENT mode's SOLA search ever consults the guide --
+        // in CYCLIC (or on a machine with no mode switch, where the mode
+        // field is ignored entirely) the whole pass below is a full
+        // render whose result nothing reads. Skip it outright.
+        let profile = StretchProcessor.profile(for: params.machine)
+        guard profile.hasModeSwitch != 0 && params.mode == AkzStretchMode_Intelligent else { return }
+
         _guideRequestGeneration += 1
         let thisGeneration = _guideRequestGeneration
         let sampleRateHz = self.sampleRateHz
 
+        // Debounce: setParams fires per knob tick, and each pass is a
+        // full StretchProcessor render -- scheduling ~120ms out and
+        // cancelling the previous item means a drag costs one guide
+        // computation, not one per tick.
+        _guideDebounceItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self._computeAndPushSpliceGuide(channels: channels, params: params, frameCount: frameCount, generation: thisGeneration, sampleRateHz: sampleRateHz)
+        }
+        _guideDebounceItem = item
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.12, execute: item)
+    }
+
+    /// The debounced body of _pushSpliceGuideIfPossible -- see that
+    /// method's doc comment for the full rationale.
+    private func _computeAndPushSpliceGuide(channels: [[Float]], params: AkzStretchParams, frameCount: Int, generation thisGeneration: Int, sampleRateHz: Double) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var mid = [Float](repeating: 0, count: frameCount)
             let scale = 1.0 / Float(channels.count)
@@ -172,6 +201,15 @@ public final class LiveAuditionController {
         }
     }
 
+    /// Cancels a pending debounced guide pass and drops the retained
+    /// source/params -- called when the controller is torn down so a
+    /// queued closure can't fire into a dead session.
+    private func _cancelPendingGuidePass() {
+        _guideDebounceItem?.cancel()
+        _guideDebounceItem = nil
+        _guideRequestGeneration += 1 // invalidate any in-flight computation's result
+    }
+
     public func start() throws {
         guard !isRunning else { return }
         try engine.start()
@@ -180,6 +218,7 @@ public final class LiveAuditionController {
 
     public func stop() {
         guard isRunning else { return }
+        _cancelPendingGuidePass()
         engine.stop()
         isRunning = false
     }

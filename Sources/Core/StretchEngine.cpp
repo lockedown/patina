@@ -97,6 +97,21 @@ double _dotProduct(const float* a, const float* b, int len) {
     return sum;
 }
 
+// Strided variant for the SOLA search's inner loop: correlating every
+// other sample of the overlap is the standard SOLA speedup -- the argmax
+// over candidate offsets is essentially unchanged (phase alignment is a
+// low-frequency property of the window, not of individual taps), and the
+// search is the dominant cost of an INTELLIGENT render. Only used for
+// overlaps large enough that halving the tap count still leaves a
+// meaningful correlation; short overlaps keep the full product.
+double _dotProductStrided(const float* a, const float* b, int len, int stride) {
+    double sum = 0.0;
+    for (int i = 0; i < len; i += stride) {
+        sum += static_cast<double>(a[i]) * static_cast<double>(b[i]);
+    }
+    return sum;
+}
+
 // Every parameter the INTELLIGENT synthesis needs, derived once from
 // (inLen, ratio, quality, width, sampleRateHz) so the actual synthesis
 // and the length-only query (outputLength(), called before process() has
@@ -204,8 +219,15 @@ void StretchEngine::_synthesizeCyclicBlocks(std::vector<float>& out, size_t numO
         const long long srcStart = static_cast<long long>(inBlockIndex) * cycleLength;
 
         float* dst = out.data() + baseOffset + k * static_cast<size_t>(cycleLength);
-        for (int i = 0; i < cycleLength; ++i) {
-            dst[i] = _sourceAt(srcStart + i);
+        if (srcStart + cycleLength <= static_cast<long long>(_quantizedSource.size())) {
+            // Whole span in range (the common case -- only the last
+            // input block can ever run off the end): one memcpy instead
+            // of a bounds check per sample.
+            std::memcpy(dst, _quantizedSource.data() + srcStart, static_cast<size_t>(cycleLength) * sizeof(float));
+        } else {
+            for (int i = 0; i < cycleLength; ++i) {
+                dst[i] = _sourceAt(srcStart + i);
+            }
         }
 
         // Crossfade the tail of this block into the head of the next
@@ -257,6 +279,10 @@ void StretchEngine::_synthesizeIntelligent(std::vector<float>& out, double ratio
         return;
     }
 
+    // The plan already computed the exact total -- reserve it once so
+    // the per-iteration inserts below never reallocate mid-render.
+    out.reserve(out.size() + plan.outputLength);
+
     // First frame is copied verbatim -- there's no existing output tail
     // yet to align it against.
     out.insert(out.end(), _quantizedSource.begin(), _quantizedSource.begin() + plan.frameSize);
@@ -283,12 +309,18 @@ void StretchEngine::_synthesizeIntelligent(std::vector<float>& out, double ratio
             // slightly, iteration to iteration, to keep splices phase-aligned.
             double bestScore = -1.0; // dot products of real audio are never below this for a non-trivial overlap
             const float* outTail = out.data() + out.size() - plan.overlapLen;
+            // Stride-2 correlation for large overlaps -- see
+            // _dotProductStrided's comment. The threshold keeps short
+            // overlaps (small width) on the full product, where halving
+            // an already-tiny tap count would genuinely degrade the
+            // alignment.
+            const int stride = plan.overlapLen >= 64 ? 2 : 1;
             for (long long delta = -plan.searchRange; delta <= plan.searchRange; ++delta) {
                 const long long candidate = nominalPos + delta;
                 if (candidate < 0 || static_cast<size_t>(candidate) + plan.overlapLen > inLen) {
                     continue;
                 }
-                const double score = _dotProduct(outTail, _quantizedSource.data() + candidate, plan.overlapLen);
+                const double score = _dotProductStrided(outTail, _quantizedSource.data() + candidate, plan.overlapLen, stride);
                 if (score > bestScore) {
                     bestScore = score;
                     bestOffset = delta;

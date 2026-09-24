@@ -75,8 +75,26 @@ public final class AudioFileService {
     /// With no DSP in between, this must round-trip bit-exact -- that
     /// identity is the whole point of this milestone (plan section 8).
     public func save(_ sample: LoadedSample, to url: URL) throws {
-        let wavFile = WavFile(format: sample.format, rawData: sample.rawData)
-        switch url.pathExtension.lowercased() {
+        let ext = url.pathExtension.lowercased()
+        let destIsAiff = (ext == "aiff" || ext == "aif")
+
+        // 8-bit PCM signedness is a container convention (WAV unsigned,
+        // AIFF signed), not a property of the audio -- a cross-container
+        // save of 8-bit data must flip the sign bias (xor 0x80) or the
+        // destination file decodes with a DC offset.
+        var rawData = sample.rawData
+        var format = sample.format
+        if format.bitsPerSample == 8 && !format.isFloat && destIsAiff != format.is8BitSigned {
+            rawData = Data(rawData.map { $0 ^ 0x80 })
+            format = WavFormat(
+                sampleRate: format.sampleRate, channelCount: format.channelCount,
+                bitsPerSample: format.bitsPerSample, isFloat: format.isFloat,
+                is8BitSigned: destIsAiff
+            )
+        }
+
+        let wavFile = WavFile(format: format, rawData: rawData)
+        switch ext {
         case "wav":
             try WavCodec.write(wavFile, to: url)
         case "aiff", "aif":

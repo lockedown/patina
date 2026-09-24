@@ -115,11 +115,9 @@ struct WaveformView: View {
 
     /// Start-point dim wash + marker, and the playhead bar -- a separate
     /// overlay layer, not drawn inside the trace Canvas above. The
-    /// Canvas recomputes min/max over the whole sample buffer on every
-    /// invocation; putting the playhead there would mean redrawing that
-    /// on every transport poll tick (20Hz) even though the traces
-    /// themselves never change between polls. This overlay's own inputs
-    /// (fractions) are cheap, so only it redraws.
+    /// Canvas's per-column peaks are memoised (see _peaks below) but the
+    /// overlay's own inputs (fractions) are cheaper still, so only it
+    /// redraws on every transport poll tick (20Hz).
     private var _transportOverlay: some View {
         GeometryReader { proxy in
             let width = proxy.size.width
@@ -171,12 +169,13 @@ struct WaveformView: View {
 
     /// Classic min/max-per-column waveform rendering: bucket the samples
     /// into one bucket per horizontal pixel and draw a vertical line
-    /// spanning that bucket's peak-to-trough range. Cheap even for a
-    /// multi-second, tens-of-thousands-of-samples buffer, since the work
-    /// is O(sample count) regardless of view width. Column/bucket
-    /// geometry lives in WaveformGeometry (AkaizerAudio) so it's unit-
-    /// tested and shared with the fraction math above, rather than
-    /// reimplemented by eye a second time here.
+    /// spanning that bucket's peak-to-trough range. The bucketing itself
+    /// is O(sample count) and memoised per (buffer, column count) --
+    /// without that, every Canvas invocation (transport polls, repaints)
+    /// re-scanned the whole buffer for an identical result.
+    /// Column/bucket geometry lives in WaveformGeometry (AkaizerAudio)
+    /// so it's unit-tested and shared with the fraction math above,
+    /// rather than reimplemented by eye a second time here.
     private func _drawTrace(context: GraphicsContext, size: CGSize, samples: [Float], referenceCount: Int, color: Color) {
         guard !samples.isEmpty else { return }
         let columns = WaveformGeometry.columnCount(width: Double(size.width))
@@ -184,16 +183,10 @@ struct WaveformView: View {
         guard occupied > 0 else { return }
         let midY = size.height / 2
 
+        let peaks = Self._peaks(for: samples, columns: occupied)
         var path = Path()
         for column in 0..<occupied {
-            let range = WaveformGeometry.bucketRange(column: column, count: samples.count, columns: occupied)
-            guard !range.isEmpty else { continue }
-            var minValue: Float = 0
-            var maxValue: Float = 0
-            for i in range {
-                minValue = Swift.min(minValue, samples[i])
-                maxValue = Swift.max(maxValue, samples[i])
-            }
+            let (minValue, maxValue) = peaks[column]
             let x = CGFloat(column)
             let yTop = midY - CGFloat(maxValue) * midY
             let yBottom = midY - CGFloat(minValue) * midY
@@ -201,5 +194,53 @@ struct WaveformView: View {
             path.addLine(to: CGPoint(x: x, y: yBottom))
         }
         context.stroke(path, with: .color(color), lineWidth: 1)
+    }
+
+    /// Cache key for _peaks: the buffer's storage identity plus a cheap
+    /// content fingerprint (first/middle/last samples), so a different
+    /// buffer that happens to reuse freed storage can't hit a stale
+    /// entry, and the column count since peaks are width-dependent.
+    private struct _PeakKey: Hashable {
+        let base: UInt
+        let count: Int
+        let columns: Int
+        let fingerprint: UInt
+    }
+
+    /// Bounded -- a handful of traces at a handful of widths is the
+    /// realistic working set; past that, drop everything rather than
+    /// grow without limit.
+    private static var _peakCache: [_PeakKey: [(Float, Float)]] = [:]
+
+    /// Per-column (min, max) pairs for `samples` bucketed into `columns`
+    /// columns -- the exact scan _drawTrace used to inline per column.
+    private static func _peaks(for samples: [Float], columns: Int) -> [(Float, Float)] {
+        let key = samples.withUnsafeBufferPointer { buf -> _PeakKey in
+            var fp: UInt = 0
+            if let first = buf.first { fp = UInt(first.bitPattern) }
+            if buf.count > 2 { fp = fp &* 31 &+ UInt(buf[buf.count / 2].bitPattern) }
+            if let last = buf.last { fp = fp &* 31 &+ UInt(last.bitPattern) }
+            return _PeakKey(
+                base: buf.baseAddress.map { UInt(bitPattern: $0) } ?? 0,
+                count: buf.count, columns: columns, fingerprint: fp
+            )
+        }
+        if let cached = _peakCache[key] { return cached }
+
+        var peaks = [(Float, Float)]()
+        peaks.reserveCapacity(columns)
+        for column in 0..<columns {
+            let range = WaveformGeometry.bucketRange(column: column, count: samples.count, columns: columns)
+            var minValue: Float = 0
+            var maxValue: Float = 0
+            for i in range {
+                minValue = Swift.min(minValue, samples[i])
+                maxValue = Swift.max(maxValue, samples[i])
+            }
+            peaks.append((minValue, maxValue))
+        }
+        if _peakCache.count > 8 { _peakCache.removeAll(keepingCapacity: true) }
+        _peakCache[key] = peaks
+        return peaks
     }
 }

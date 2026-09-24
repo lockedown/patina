@@ -20,6 +20,19 @@ constexpr double kCrossfadeSeconds = 0.005;
 RealtimeStretchPlayer::RealtimeStretchPlayer(double sampleRateHz)
     : _engine(sampleRateHz),
       _crossfadeLength(static_cast<size_t>(std::max(1.0, sampleRateHz * kCrossfadeSeconds))) {
+    // Equal-power fade gains, indexed by the remaining-fade count pull()
+    // already tracks -- replaces two per-sample sqrt() calls during the
+    // (short) fade window. _fadeOldGain[r] = sqrt(r/L), _fadeNewGain[r]
+    // = sqrt(1 - r/L): the same values pull() used to derive from
+    // t = 1 - r/L (1-(1-x) == x exactly for x in [0,1], so this is
+    // bit-identical, not an approximation).
+    _fadeOldGain.resize(_crossfadeLength + 1);
+    _fadeNewGain.resize(_crossfadeLength + 1);
+    for (size_t r = 0; r <= _crossfadeLength; ++r) {
+        const double t = 1.0 - static_cast<double>(r) / static_cast<double>(_crossfadeLength);
+        _fadeOldGain[r] = static_cast<float>(std::sqrt(std::max(0.0, 1.0 - t)));
+        _fadeNewGain[r] = static_cast<float>(std::sqrt(std::max(0.0, t)));
+    }
     _worker = std::thread(&RealtimeStretchPlayer::_workerLoop, this);
 }
 
@@ -78,7 +91,7 @@ void RealtimeStretchPlayer::_workerLoop() {
             lastSeenGeneration = _requestGeneration;
 
             if (_hasPendingSource) {
-                localSource = _pendingSource; // copy out while locked; recompute below happens unlocked
+                localSource = std::move(_pendingSource); // move, not copy -- the pending slot is cleared anyway, and this is a whole-buffer transfer under the lock
                 haveSource = true;
                 _hasPendingSource = false;
                 sourceChangedThisIteration = true;
@@ -89,7 +102,7 @@ void RealtimeStretchPlayer::_workerLoop() {
                 _hasPendingParams = false;
             }
             if (_hasPendingSpliceGuide) {
-                localSpliceGuide = _pendingSpliceGuide;
+                localSpliceGuide = std::move(_pendingSpliceGuide);
                 haveSpliceGuide = true;
                 _hasPendingSpliceGuide = false;
                 spliceGuideChangedThisIteration = true;
@@ -210,10 +223,11 @@ size_t RealtimeStretchPlayer::pull(float* outFrames, size_t maxOutFrames) {
             // Equal-power fade: gains are sqrt(t)/sqrt(1-t) rather than a
             // straight linear ramp, so the perceived loudness through the
             // blend stays constant instead of dipping at the midpoint.
-            const double t = 1.0 - static_cast<double>(crossfadeRemaining) / static_cast<double>(_crossfadeLength);
-            const float gainOld = static_cast<float>(std::sqrt(std::max(0.0, 1.0 - t)));
-            const float gainNew = static_cast<float>(std::sqrt(std::max(0.0, t)));
-            outFrames[i] = gainOld * (*crossfadeFrom)[pos] + gainNew * newSample;
+            // Tables are indexed by the remaining count -- see the
+            // constructor for why that's the same value the old
+            // per-sample sqrt produced.
+            outFrames[i] = _fadeOldGain[crossfadeRemaining] * (*crossfadeFrom)[pos]
+                         + _fadeNewGain[crossfadeRemaining] * newSample;
             --crossfadeRemaining;
         } else {
             outFrames[i] = newSample;

@@ -145,6 +145,18 @@ struct ContentView: View {
     @State private var originalWaveformSamples: [Float] = []
     @State private var processedWaveformSamples: [Float]?
 
+    /// The loaded file's full de-interleaved Float channels, decoded
+    /// once in _adoptAsCurrentSample -- every playback/audition path
+    /// slices this (via _trimmedToStartFrame) instead of re-running
+    /// PCMConversion.toFloat+deinterleave over the whole file per call.
+    @State private var decodedChannels: [[Float]] = []
+
+    /// True while process()'s detached render is in flight -- drives
+    /// the Process button's label/disabled state. The render used to
+    /// run synchronously on the main thread; this flag is what replaced
+    /// the frozen UI with a visible busy state.
+    @State private var isProcessing = false
+
     // -- waveform transport (2.1 feedback: "show playback bar over
     // sample waveform... click and move start point with mouse") -------
 
@@ -832,8 +844,8 @@ struct ContentView: View {
                     .onReceive(_recomputingPollTimer) { _ in _pollTransport() }
 
                     HStack {
-                        Button("Process", action: process)
-                            .disabled(loadedSample == nil) // see the Preview button's comment above -- every machine has something to process, not just stretch-capable ones
+                        Button(isProcessing ? "Processing…" : "Process", action: process)
+                            .disabled(loadedSample == nil || isProcessing) // see the Preview button's comment above -- every machine has something to process, not just stretch-capable ones
                         Button("Revert", action: _revertToOriginal)
                             .disabled(loadedSample == nil || (_snapshot() == .defaults(for: selectedMachine) && processedChannels == nil))
                             .help("Reset all parameters to \(machineProfile.displayName) defaults and discard the processed render. Does not modify the file on disk.")
@@ -1012,9 +1024,14 @@ struct ContentView: View {
         playingSource = .none
         playheadFraction = nil
 
+        // Decode ONCE here -- every consumer (waveform, Play Original,
+        // Play Processed's loudness reference, live audition, scrub-end
+        // source push) slices this cache rather than re-running
+        // PCMConversion.toFloat+deinterleave over the whole file per
+        // call, which is what they each used to do independently.
         let interleaved = PCMConversion.toFloat(sample.rawData, format: sample.format)
-        let channels = PCMConversion.deinterleave(interleaved, channelCount: sample.channelCount)
-        originalWaveformSamples = channels.first ?? []
+        decodedChannels = PCMConversion.deinterleave(interleaved, channelCount: sample.channelCount)
+        originalWaveformSamples = decodedChannels.first ?? []
     }
 
     /// 2.3 feedback (the S950 chain-restretch trick: stretch, then stretch
@@ -1226,12 +1243,15 @@ struct ContentView: View {
     }
 
     /// True once processedChannels no longer matches the params it was
-    /// rendered with. Deliberately never used to disable anything -- a
-    /// stale render is still valid audio -- only to mark Play/Save
-    /// Processed and to decide whether a drag-out export needs to
-    /// re-render first.
+    /// rendered with. Doesn't disable anything -- a stale render is still
+    /// valid audio -- only to mark Play/Save Processed and to decide
+    /// whether a drag-out export needs to re-render first. Compares
+    /// effective() projections, not raw snapshots: a knob the engine
+    /// provably ignores (parked bandwidth on a fixed-rate machine,
+    /// resonance on a non-resonant filter, cycle in INTELLIGENT mode)
+    /// can't make the render stale -- see ParamSnapshot.effective().
     private var _renderIsStale: Bool {
-        processedChannels != nil && (renderedSnapshot != _snapshot() || renderedStartFrame != startFrame)
+        processedChannels != nil && (renderedSnapshot?.effective() != _snapshot().effective() || renderedStartFrame != startFrame)
     }
 
     /// Converts whichever source is actually playing's OWN [0, 1)
@@ -1542,8 +1562,7 @@ struct ContentView: View {
         // versions... on top of one another" bug.
         playback.stop()
         isPlayingOffline = false
-        let interleaved = PCMConversion.toFloat(sample.rawData, format: sample.format)
-        let channels = _trimmedToStartFrame(PCMConversion.deinterleave(interleaved, channelCount: sample.channelCount))
+        let channels = _trimmedToStartFrame(decodedChannels)
 
         let controller = LiveAuditionController(channelCount: sample.channelCount, sampleRateHz: sample.sampleRateHz)
         controller.setSource(channels: channels)
@@ -1583,25 +1602,36 @@ struct ContentView: View {
     /// ends. Matches AkaizerCore.h's documented "audition is not
     /// expected to be phase-continuous across a change."
     private func _pushLiveSourceIfNeeded() {
-        guard isLiveAuditionOn, let controller = liveController, let sample = loadedSample else { return }
-        let interleaved = PCMConversion.toFloat(sample.rawData, format: sample.format)
-        let channels = _trimmedToStartFrame(PCMConversion.deinterleave(interleaved, channelCount: sample.channelCount))
-        controller.setSource(channels: channels)
+        guard isLiveAuditionOn, let controller = liveController, loadedSample != nil else { return }
+        controller.setSource(channels: _trimmedToStartFrame(decodedChannels))
     }
 
+    /// Kicks off an offline render on a detached task -- the same
+    /// pattern _saveWhatImHearing already uses. Used to run
+    /// synchronously on the main thread, which froze the whole UI for
+    /// the duration of a multi-minute file's render; isProcessing
+    /// drives the button's busy state in the meantime.
     private func process() {
-        guard let sample = loadedSample else { return }
+        guard let sample = loadedSample, !isProcessing else { return }
 
         let snapshot = _snapshot()
-        let outputChannels = ProcessedRender.render(sample: sample, params: snapshot.params, startFrame: startFrame)
-
-        processedChannels = outputChannels
-        processedWaveformSamples = outputChannels.first
-        renderedSnapshot = snapshot
-        renderedStartFrame = startFrame
-        hasUnsavedProcessedAudio = true
-        let outFrames = outputChannels.first?.count ?? 0
-        statusMessage = "Processed: \(sample.frameCount) → \(outFrames) frames (\(String(format: "%.2f", Double(outFrames) / sample.sampleRateHz))s)."
+        let params = snapshot.params
+        let capturedStartFrame = startFrame
+        isProcessing = true
+        statusMessage = "Processing…"
+        Task {
+            let outputChannels = await Task.detached(priority: .userInitiated) {
+                ProcessedRender.render(sample: sample, params: params, startFrame: capturedStartFrame)
+            }.value
+            processedChannels = outputChannels
+            processedWaveformSamples = outputChannels.first
+            renderedSnapshot = snapshot
+            renderedStartFrame = capturedStartFrame
+            hasUnsavedProcessedAudio = true
+            isProcessing = false
+            let outFrames = outputChannels.first?.count ?? 0
+            statusMessage = "Processed: \(sample.frameCount) → \(outFrames) frames (\(String(format: "%.2f", Double(outFrames) / sample.sampleRateHz))s)."
+        }
     }
 
     /// Slices `channels` (full-length, one array per channel) at
@@ -1617,8 +1647,7 @@ struct ContentView: View {
 
     private func playOriginal() {
         guard let sample = loadedSample else { return }
-        let interleaved = PCMConversion.toFloat(sample.rawData, format: sample.format)
-        let channels = _trimmedToStartFrame(PCMConversion.deinterleave(interleaved, channelCount: sample.channelCount))
+        let channels = _trimmedToStartFrame(decodedChannels)
         do {
             try playback.play(channels: channels, sampleRateHz: sample.sampleRateHz)
             isPlayingOffline = true
@@ -1640,8 +1669,7 @@ struct ContentView: View {
         // `channels` itself is NOT trimmed again here: it's already the
         // trimmed render (see ProcessedRender.render's startFrame), and
         // double-trimming it would cut the start point twice over.
-        let originalInterleaved = PCMConversion.toFloat(sample.rawData, format: sample.format)
-        let originalChannels = _trimmedToStartFrame(PCMConversion.deinterleave(originalInterleaved, channelCount: sample.channelCount))
+        let originalChannels = _trimmedToStartFrame(decodedChannels)
         let referenceRMS = PCMConversion.rms(originalChannels)
         let gain = PCMConversion.matchedGain(channels, toMatchRMS: referenceRMS)
         let matchedChannels = PCMConversion.applyGain(channels, gain: gain)

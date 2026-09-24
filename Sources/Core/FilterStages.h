@@ -27,7 +27,9 @@
 #include "include/AkaizerCore.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <memory>
 #include <vector>
 
@@ -39,6 +41,21 @@ class IFilterStage {
 public:
     virtual ~IFilterStage() = default;
     virtual float process(float x) = 0;
+
+    // Block-level counterpart of process() -- one virtual call per
+    // buffer instead of one per sample, so each concrete stage can keep
+    // its state in registers across the loop (the per-sample override
+    // can't: the call boundary forces state back to memory every
+    // sample). Default loops process(); every stage below overrides it
+    // with the same math written as an internal loop -- bit-identical,
+    // just faster. Callers processing whole buffers (applyFilter,
+    // RealtimeChannel's MachineChain) should always use this.
+    virtual void processBlock(float* buf, size_t count) {
+        for (size_t i = 0; i < count; ++i) {
+            buf[i] = process(buf[i]);
+        }
+    }
+
     virtual void retune(double cutoffHz, int resonanceCode) = 0;
 
     // Zeroes internal filter memory WITHOUT touching coefficients --
@@ -76,9 +93,13 @@ inline double filterStagesSoftKneeLimit(double x) {
 // original comment for the "not a precision Butterworth" caveat.
 class OnePoleLowpassCascade : public IFilterStage {
 public:
+    // 8 covers every profile in the roster with headroom (36 dB/oct -> 6
+    // poles is today's max); poles is clamped to it rather than trusted.
+    static constexpr int kMaxPoles = 8;
+
     OnePoleLowpassCascade(int poles, double cutoffHz, double sampleRateHz)
-        : _poles(std::max(1, poles)), _sampleRateHz(sampleRateHz) {
-        _state.assign(static_cast<size_t>(_poles), 0.0);
+        : _poles(std::max(1, std::min(kMaxPoles, poles))), _sampleRateHz(sampleRateHz) {
+        _state.fill(0.0);
         retune(cutoffHz, 0);
     }
 
@@ -91,20 +112,38 @@ public:
         return static_cast<float>(v);
     }
 
+    void processBlock(float* buf, size_t count) override {
+        // Same math as process(), with the pole state held in a local
+        // array across the loop -- the compiler can keep it in registers
+        // instead of round-tripping _state through memory per sample.
+        std::array<double, kMaxPoles> state = _state;
+        const double a = _a;
+        const int poles = _poles;
+        for (size_t n = 0; n < count; ++n) {
+            double v = static_cast<double>(buf[n]);
+            for (int i = 0; i < poles; ++i) {
+                state[static_cast<size_t>(i)] += a * (v - state[static_cast<size_t>(i)]);
+                v = state[static_cast<size_t>(i)];
+            }
+            buf[n] = static_cast<float>(v);
+        }
+        _state = state;
+    }
+
     void retune(double cutoffHz, int /*resonanceCode*/) override {
         const double clampedCutoff = std::min(cutoffHz, _sampleRateHz * 0.49);
         _a = 1.0 - std::exp(-2.0 * M_PI * clampedCutoff / _sampleRateHz);
     }
 
     void reset() override {
-        std::fill(_state.begin(), _state.end(), 0.0);
+        _state.fill(0.0);
     }
 
 private:
     int _poles;
     double _sampleRateHz;
     double _a = 0.0;
-    std::vector<double> _state;
+    std::array<double, kMaxPoles> _state;
 };
 
 // The exact difference equation from the reverse-engineered
@@ -128,6 +167,22 @@ public:
         _low = std::max(-kStateLimit, std::min(kStateLimit, _low));
 
         return static_cast<float>(_low);
+    }
+
+    void processBlock(float* buf, size_t count) override {
+        double low = _low, band = _band;
+        const double k = _k, damping = _damping;
+        constexpr double kStateLimit = 100.0;
+        for (size_t n = 0; n < count; ++n) {
+            const double h = static_cast<double>(buf[n]) - low - damping * band;
+            band += k * h;
+            low += k * band;
+            band = std::max(-kStateLimit, std::min(kStateLimit, band));
+            low = std::max(-kStateLimit, std::min(kStateLimit, low));
+            buf[n] = static_cast<float>(low);
+        }
+        _low = low;
+        _band = band;
     }
 
     void retune(double cutoffHz, int resonanceCode) override {
@@ -169,6 +224,23 @@ public:
         _ic1eq = 2.0 * v1 - _ic1eq;
         _ic2eq = 2.0 * v2 - _ic2eq;
         return static_cast<float>(filterStagesSoftKneeLimit(v2 * _outputMakeup));
+    }
+
+    void processBlock(float* buf, size_t count) override {
+        double ic1eq = _ic1eq, ic2eq = _ic2eq;
+        const double a1 = _a1, a2 = _a2, a3 = _a3;
+        const double inputScale = _inputScale, outputMakeup = _outputMakeup;
+        for (size_t n = 0; n < count; ++n) {
+            const double v0 = static_cast<double>(buf[n]) * inputScale;
+            const double v3 = v0 - ic2eq;
+            const double v1 = a1 * ic1eq + a2 * v3;
+            const double v2 = ic2eq + a2 * ic1eq + a3 * v3;
+            ic1eq = 2.0 * v1 - ic1eq;
+            ic2eq = 2.0 * v2 - ic2eq;
+            buf[n] = static_cast<float>(filterStagesSoftKneeLimit(v2 * outputMakeup));
+        }
+        _ic1eq = ic1eq;
+        _ic2eq = ic2eq;
     }
 
     void retune(double cutoffHz, int resonanceCode) override {
@@ -226,6 +298,28 @@ public:
         }
 
         return static_cast<float>(filterStagesSoftKneeLimit(_stage[3] * _outputMakeup));
+    }
+
+    void processBlock(float* buf, size_t count) override {
+        double stage[4] = {_stage[0], _stage[1], _stage[2], _stage[3]};
+        const double g = _g, resonanceAmount = _resonanceAmount;
+        const double inputScale = _inputScale, outputMakeup = _outputMakeup;
+        constexpr double kStateLimit = 100.0;
+        for (size_t n = 0; n < count; ++n) {
+            const double feedback = std::tanh(resonanceAmount * stage[3]);
+            double v = static_cast<double>(buf[n]) * inputScale - feedback;
+            for (int i = 0; i < 4; ++i) {
+                stage[i] += g * (v - stage[i]);
+                v = stage[i];
+            }
+            for (double& s : stage) {
+                s = std::max(-kStateLimit, std::min(kStateLimit, s));
+            }
+            buf[n] = static_cast<float>(filterStagesSoftKneeLimit(stage[3] * outputMakeup));
+        }
+        for (int i = 0; i < 4; ++i) {
+            _stage[i] = stage[i];
+        }
     }
 
     void retune(double cutoffHz, int resonanceCode) override {

@@ -28,6 +28,7 @@
 #include "include/AkaizerCore.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <vector>
@@ -40,9 +41,14 @@ namespace akz {
 // coefficients, keep _state.
 class OnePoleLPF {
 public:
+    // Same fixed-capacity reasoning as FilterStages.h's
+    // OnePoleLowpassCascade -- aaFilterPoles is a small per-machine
+    // constant, clamped rather than trusted.
+    static constexpr int kMaxPoles = 8;
+
     OnePoleLPF(int poles, double cutoffHz, double sampleRateHz)
-        : _poles(std::max(1, poles)), _sampleRateHz(sampleRateHz) {
-        _state.assign(static_cast<size_t>(_poles), 0.0);
+        : _poles(std::max(1, std::min(kMaxPoles, poles))), _sampleRateHz(sampleRateHz) {
+        _state.fill(0.0);
         retune(cutoffHz);
     }
 
@@ -55,20 +61,38 @@ public:
         return static_cast<float>(v);
     }
 
+    // Whole-buffer counterpart of process() -- same math, with the pole
+    // state held in a local array across the loop so it can stay in
+    // registers instead of round-tripping _state per sample.
+    void processBlock(float* buf, size_t count) {
+        std::array<double, kMaxPoles> state = _state;
+        const double a = _a;
+        const int poles = _poles;
+        for (size_t n = 0; n < count; ++n) {
+            double v = static_cast<double>(buf[n]);
+            for (int i = 0; i < poles; ++i) {
+                state[static_cast<size_t>(i)] += a * (v - state[static_cast<size_t>(i)]);
+                v = state[static_cast<size_t>(i)];
+            }
+            buf[n] = static_cast<float>(v);
+        }
+        _state = state;
+    }
+
     void retune(double cutoffHz) {
         const double clampedCutoff = std::min(cutoffHz, _sampleRateHz * 0.49);
         _a = 1.0 - std::exp(-2.0 * M_PI * clampedCutoff / _sampleRateHz);
     }
 
     void reset() {
-        std::fill(_state.begin(), _state.end(), 0.0);
+        _state.fill(0.0);
     }
 
 private:
     int _poles;
     double _sampleRateHz;
     double _a = 0.0;
-    std::vector<double> _state;
+    std::array<double, kMaxPoles> _state;
 };
 
 // Persistent-state counterpart of RateModel.cpp's holdAtRate(). configure()

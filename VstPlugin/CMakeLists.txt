@@ -16,7 +16,7 @@
 # specific except the MSVC-only compile definitions below.
 
 cmake_minimum_required(VERSION 3.22)
-project(PatinaFX VERSION 0.1.0)
+project(PatinaFX VERSION 0.2.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -72,7 +72,7 @@ juce_add_plugin(PatinaFX
     COMPANY_NAME "Patina"
     PLUGIN_MANUFACTURER_CODE Ptna
     PLUGIN_CODE Pfx1
-    FORMATS VST3 Standalone
+    FORMATS VST3 AU Standalone
     PRODUCT_NAME "Patina FX"
     IS_SYNTH FALSE
     NEEDS_MIDI_INPUT FALSE

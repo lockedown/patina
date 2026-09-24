@@ -95,6 +95,55 @@ public struct ParamSnapshot: Equatable, Sendable {
     public static func defaults(for machine: AkzMachine) -> ParamSnapshot {
         ParamSnapshot(params: StretchProcessor.defaultParams(machine: machine))
     }
+
+    /// The snapshot as the DSP engine actually hears it -- every field
+    /// the engine provably ignores for this machine/mode is normalised
+    /// to a canonical value, so two snapshots that differ ONLY in inert
+    /// fields compare equal. This is the right equality for "would a
+    /// re-render produce different audio" (ContentView's _renderIsStale),
+    /// as opposed to plain ==, which is the right equality for "did the
+    /// user move a knob" (undo coalescing -- a parked knob move is still
+    /// a real edit worth undoing).
+    ///
+    /// Mirrors the engine's own gates, not the UI's: mode is ignored
+    /// without hasModeSwitch (StretchEngine's effectiveMode); stretch,
+    /// the mode-specific knobs and the engine variant are all inert
+    /// without supportsTimeStretch (the engine forces ratio 1.0);
+    /// cycle applies only in CYCLIC, quality/width only in INTELLIGENT;
+    /// resonance is ignored without filterHasResonance; and on a
+    /// single-fixed-rate machine (min == max, e.g. SP-1200) the
+    /// bandwidth value resolves to the fixed rate regardless of what
+    /// the knob holds (resolveSampleRateHz). Dual-fixed-rate machines
+    /// (S1000 family) DO consume the value -- it snaps to the nearer
+    /// rate -- so it stays effective there even though the app UI
+    /// doesn't show the knob.
+    public func effective() -> ParamSnapshot {
+        let profile = StretchProcessor.profile(for: machine)
+        var e = self
+        if profile.hasModeSwitch == 0 {
+            e.mode = AkzStretchMode_Cyclic
+        }
+        let isIntelligent = profile.hasModeSwitch != 0 && e.mode == AkzStretchMode_Intelligent
+        if profile.supportsTimeStretch == 0 {
+            e.stretchPercent = 100
+            e.cycleLength = 0
+            e.quality = 0
+            e.width = 0
+            e.engine = AkzEngine_Classic
+        } else if isIntelligent {
+            e.cycleLength = 0
+        } else {
+            e.quality = 0
+            e.width = 0
+        }
+        if profile.filterHasResonance == 0 {
+            e.filterResonance = 0
+        }
+        if profile.minSampleRateHz == profile.maxSampleRateHz {
+            e.sampleRateHz = profile.minSampleRateHz
+        }
+        return e
+    }
 }
 
 public extension AkaizerPreset {

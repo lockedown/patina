@@ -21,22 +21,20 @@ namespace {
 // Shared by applyRecordPath's decimation step and applyDacPath: true
 // decimation to targetRateHz followed by zero-order-hold reconstruction
 // back to hostSampleRateHz, computed as one combined pass rather than
-// through an intermediate shorter buffer -- see RateModel.h. Reads from
-// a filtered copy while writing the held result back into `buffer` in
-// place, since reading and writing the same array at different rates in
-// a single forward pass would otherwise let already-overwritten
-// "future" samples leak into the read side. Caller guarantees
+// through an intermediate shorter buffer -- see RateModel.h. Safe to run
+// in place: the read (buffer[i] on a boundary crossing) and the write
+// (buffer[i] = held) are always the SAME index, so no already-overwritten
+// "future" sample can ever leak into the read side. Caller guarantees
 // targetRateHz < hostSampleRateHz (the no-decimation-needed case is each
 // caller's own early return, since what happens instead -- quantise
 // only, vs. nothing at all -- differs between them).
 void holdAtRate(float* buffer, size_t count, double targetRateHz, double hostSampleRateHz) {
-    const std::vector<float> source(buffer, buffer + count);
     const double samplesPerTargetSample = hostSampleRateHz / targetRateHz;
     double nextBoundary = 0.0;
-    float held = source[0];
+    float held = buffer[0];
     for (size_t i = 0; i < count; ++i) {
         if (static_cast<double>(i) >= nextBoundary) {
-            held = source[i];
+            held = buffer[i];
             nextBoundary += samplesPerTargetSample;
         }
         buffer[i] = held;
@@ -93,9 +91,7 @@ void applyRecordPath(float* buffer, size_t count, AkzMachine machine, double eff
     const double aaCutoffHz = effectiveRateHz * profile.aaFilterCutoffRatio;
     {
         OnePoleLPF aa(profile.aaFilterPoles, aaCutoffHz, hostSampleRateHz);
-        for (size_t i = 0; i < count; ++i) {
-            buffer[i] = aa.process(buffer[i]);
-        }
+        aa.processBlock(buffer, count);
     }
 
     // True decimation to effectiveRateHz followed by zero-order-hold
