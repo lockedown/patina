@@ -495,7 +495,10 @@ typedef struct AkzRealtimeChannelParams {
     // <= 0 means "use machine's own native bit depth" (profile.bitDepth
     // -- 12 for S900/S950, etc.). A positive value overrides it, letting
     // the live "Bit Depth" control dial anywhere from 1-24 regardless of
-    // which machine is selected -- companding (Emulator II's mu-law) is
+    // which machine is selected -- but CAPPED at the machine's native
+    // depth: the override is a crusher, not an upgrade, so a request
+    // above native resolves to native rather than cleaning the machine
+    // up past its own converter. Companding (Emulator II's mu-law) is
     // still taken from the machine profile either way; only the linear
     // quantisation step count is overridden.
     int bitDepth;

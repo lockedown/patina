@@ -230,10 +230,54 @@ AKZ_TEST(bit_depth_override_of_zero_matches_machine_native_depth) {
     }
 }
 
+AKZ_TEST(bit_depth_override_above_native_clamps_to_machine_native) {
+    // The override is a crusher, not an upgrade: requesting 24 bits on
+    // a 12-bit machine must resolve to the machine's own native depth,
+    // bit-identical to passing 0 (native).
+    const double hostRate = 44100.0;
+    auto input = makeSine(4000, 300.0, hostRate);
+
+    auto over = makeSettledChannel(hostRate, input.size(), makeParams(AkzMachine_S900, 24, 0.0f, 1.0f, 0.0f));
+    auto bufA = input;
+    over->process(bufA.data(), bufA.size());
+
+    auto native = makeSettledChannel(hostRate, input.size(), makeParams(AkzMachine_S900, 0, 0.0f, 1.0f, 0.0f));
+    auto bufB = input;
+    native->process(bufB.data(), bufB.size());
+
+    for (size_t i = 0; i < bufA.size(); ++i) {
+        AKZ_CHECK_EQ(bufA[i], bufB[i]);
+    }
+}
+
+AKZ_TEST(input_anti_alias_filter_runs_even_at_or_above_host_rate) {
+    // The machine's input front end is always in circuit: at an
+    // effective rate >= host rate the decimate/hold stages are
+    // identity, but the AA filter still colours the signal -- output
+    // must differ from a quantise-only reference.
+    const double hostRate = 44100.0;
+    auto input = makeSine(4000, 10000.0, hostRate); // high enough for the AA filter to bite
+
+    auto channel = makeSettledChannel(hostRate, input.size(), makeParams(AkzMachine_S1000, 0, 0.0f, 1.0f, 0.0f));
+    auto buf = input;
+    channel->process(buf.data(), buf.size());
+
+    auto quantiseOnly = input;
+    quantizeBuffer(quantiseOnly.data(), quantiseOnly.size(), akz_machine_profile(AkzMachine_S1000)->bitDepth);
+
+    bool differs = false;
+    for (size_t i = 200; i < buf.size(); ++i) {
+        if (std::fabs(buf[i] - quantiseOnly[i]) > 1e-4) { differs = true; break; }
+    }
+    AKZ_CHECK(differs);
+}
+
 AKZ_TEST(lower_bit_depth_override_produces_more_quantisation_error) {
-    // Rate stage bypassed (sampleRateHz == hostRate) and filter left wide
+    // Holds bypassed (sampleRateHz == hostRate) and filter left wide
     // open so bit-depth is the dominant source of the difference from
-    // the raw input.
+    // the raw input. The AA filter still runs (always in circuit) but
+    // identically on both channels, so it cancels out of the
+    // comparison.
     const double hostRate = 44100.0;
     auto input = makeSine(4000, 220.0, hostRate, 0.9f);
 

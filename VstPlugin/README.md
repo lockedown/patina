@@ -21,10 +21,17 @@ One machine (from the same ten-machine heritage roster as the main app)
 colors the channel's audio through:
 
 1. **Rate/bandwidth** — the machine's anti-alias + decimate/hold front
-   end (fixed per machine, or a live "Bandwidth" knob on S900/S950).
+   end. The input anti-alias filter is always in circuit (it's the
+   machine's ADC front end, not a decimation side effect); decimation
+   engages whenever the machine's rate is below the host's — including
+   fixed-rate machines like the S1000 on a 48 kHz host. Bandwidth is a
+   live knob on continuously-variable machines (S900/S950, Fairlight,
+   Mirage) and snaps between the two real rates on dual-fixed-rate
+   machines (S1000/S2000/S3000/S3200).
 2. **Bit depth** — the machine's native converter, with a live override
-   (1–24 bits) on top; companding (Emulator II's mu-law) is always the
-   machine's own.
+   (1–24 bits) on top, capped at native: the override can only crush
+   further, never clean the machine up past its own converter.
+   Companding (Emulator II's mu-law) is always the machine's own.
 3. **Filter** — the machine's own topology (one-pole cascade, Chamberlin/
    TPT state-variable, or SSM-style ladder), with live Cutoff and (where
    the machine has one) Resonance.
@@ -105,8 +112,8 @@ yet done, before shipping:
 | Parameter  | Range           | Notes                                             |
 |------------|-----------------|----------------------------------------------------|
 | Machine    | 10 choices      | Saved by stable id, not index — safe across reorder |
-| Bit Depth  | 0 (native)–24   | 0 = machine's own native depth                     |
-| Bandwidth  | 1000–48000 Hz   | Only audible on S900/S950; harmless (clamped) elsewhere |
+| Bit Depth  | 0 (native)–24   | 0 = machine's own native depth; values above native clamp to it |
+| Bandwidth  | 7000–48000 Hz   | Continuous on variable-rate machines; snaps to the two real rates on S1000/S2000/S3000/S3200; hidden on single-rate machines |
 | Cutoff     | 0–1             | Logarithmic 20 Hz–Nyquist, matches the app's own knob |
 | Resonance  | 0–1             | Only audible on machines with a resonant filter    |
 | Mix        | 0–1             | Dry/wet                                            |

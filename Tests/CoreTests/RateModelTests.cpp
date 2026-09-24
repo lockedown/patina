@@ -6,6 +6,7 @@
 
 #include "TestFramework.h"
 #include "../../Sources/Core/RateModel.h"
+#include "../../Sources/Core/RateStages.h"
 #include "../../Sources/Core/ConverterModel.h"
 #include "include/AkaizerCore.h"
 
@@ -62,8 +63,8 @@ AKZ_TEST(record_path_at_a_variable_machines_own_default_rate_is_not_a_no_op) {
     // S900's own default (its maxSampleRateHz, 40000, resolved from the 0
     // sentinel above) is BELOW a 44.1kHz host, so running the record path
     // at that rate must genuinely decimate+anti-alias, not pass through
-    // untouched the way record_path_at_host_rate_is_pure_quantisation_
-    // no_incidental_filtering pins for the >= host-rate case.
+    // untouched the way record_path_at_host_rate_still_applies_the_input_
+    // filter pins for the >= host-rate case.
     const double hostRate = 44100.0;
     const AkzMachineProfile* s900 = akz_machine_profile(AkzMachine_S900);
     auto source = makeSine(2000, 300.0, hostRate);
@@ -89,28 +90,51 @@ AKZ_TEST(positive_sample_rate_clamps_into_machine_range) {
 
 AKZ_TEST(fixed_dual_rate_machine_collapses_any_request_to_its_two_real_rates) {
     // S1000 has hasVariableSampleRate == 0 -- min/max ARE its two real
-    // selectable rates (22050/44100), not a continuous range. Clamping
-    // into [min, max] must still resolve sensibly at both ends.
+    // selectable rates (22050/44100), not a continuous range. Requests
+    // snap to the nearer bound, including mid-range values a plain
+    // clamp would have admitted (a rate the hardware never had).
     AKZ_CHECK_NEAR(resolveSampleRateHz(AkzMachine_S1000, 22050.0f, 44100.0), 22050.0, 0.001);
     AKZ_CHECK_NEAR(resolveSampleRateHz(AkzMachine_S1000, 44100.0f, 44100.0), 44100.0, 0.001);
     AKZ_CHECK_NEAR(resolveSampleRateHz(AkzMachine_S1000, 1.0f, 44100.0), 22050.0, 0.001); // below range, clamps to the lower real rate
+    // Midpoint of [22050, 44100] is 33075 -- just below snaps down,
+    // at/above snaps up.
+    AKZ_CHECK_NEAR(resolveSampleRateHz(AkzMachine_S1000, 30000.0f, 44100.0), 22050.0, 0.001);
+    AKZ_CHECK_NEAR(resolveSampleRateHz(AkzMachine_S1000, 33074.0f, 44100.0), 22050.0, 0.001);
+    AKZ_CHECK_NEAR(resolveSampleRateHz(AkzMachine_S1000, 33075.0f, 44100.0), 44100.0, 0.001);
+    AKZ_CHECK_NEAR(resolveSampleRateHz(AkzMachine_S1000, 40000.0f, 44100.0), 44100.0, 0.001);
 }
 
-AKZ_TEST(record_path_at_host_rate_is_pure_quantisation_no_incidental_filtering) {
-    // effectiveRateHz >= hostSampleRateHz must skip the anti-alias
-    // filter entirely, not just skip decimation -- a machine at its own
-    // native/host rate should sound identical to before this stage
-    // existed. Verified by comparing against calling quantizeBuffer
-    // directly with the same bit depth, bit for bit.
-    auto source = makeSine(2000, 1000.0, 44100.0);
+AKZ_TEST(record_path_at_host_rate_still_applies_the_input_filter) {
+    // effectiveRateHz >= hostSampleRateHz skips only the decimate/hold
+    // (mathematical identity there) -- the anti-alias filter is the
+    // machine's always-on input front end and still runs. Verified two
+    // ways: the output must differ from a quantise-only reference (the
+    // filter genuinely did something), and it must match a manual
+    // OnePoleLPF -> quantizeBuffer sequence bit for bit.
+    const double hostRate = 44100.0;
+    const AkzMachineProfile* profile = akz_machine_profile(AkzMachine_S1000);
+    auto source = makeSine(2000, 10000.0, hostRate); // high enough for the AA filter to bite
     auto viaRecordPath = source;
     auto viaQuantizeOnly = source;
+    auto viaManualChain = source;
 
-    applyRecordPath(viaRecordPath.data(), viaRecordPath.size(), AkzMachine_S1000, 44100.0, 44100.0);
-    quantizeBuffer(viaQuantizeOnly.data(), viaQuantizeOnly.size(), akz_machine_profile(AkzMachine_S1000)->bitDepth);
+    applyRecordPath(viaRecordPath.data(), viaRecordPath.size(), AkzMachine_S1000, 44100.0, hostRate);
+    quantizeBuffer(viaQuantizeOnly.data(), viaQuantizeOnly.size(), profile->bitDepth);
+
+    {
+        OnePoleLPF aa(profile->aaFilterPoles, 44100.0 * profile->aaFilterCutoffRatio, hostRate);
+        for (auto& s : viaManualChain) s = aa.process(s);
+    }
+    quantizeBuffer(viaManualChain.data(), viaManualChain.size(), profile->bitDepth);
+
+    bool differsFromQuantiseOnly = false;
+    for (size_t i = 0; i < source.size(); ++i) {
+        if (std::abs(viaRecordPath[i] - viaQuantizeOnly[i]) > 1e-6) { differsFromQuantiseOnly = true; break; }
+    }
+    AKZ_CHECK(differsFromQuantiseOnly);
 
     for (size_t i = 0; i < source.size(); ++i) {
-        AKZ_CHECK_NEAR(viaRecordPath[i], viaQuantizeOnly[i], 1e-9);
+        AKZ_CHECK_NEAR(viaRecordPath[i], viaManualChain[i], 1e-9);
     }
 }
 

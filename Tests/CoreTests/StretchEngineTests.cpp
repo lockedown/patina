@@ -10,6 +10,7 @@
 #include "include/AkaizerCore.h"
 #include "../../Sources/Core/ConverterModel.h"
 #include "../../Sources/Core/FilterModel.h"
+#include "../../Sources/Core/RateModel.h"
 #include "../../Sources/Core/StretchEngine.h"
 
 #include <algorithm>
@@ -78,9 +79,12 @@ AKZ_TEST(cyclic_at_100_percent_with_dividing_cycle_length_is_bit_exact_identity)
     // transposeSemitones defaults to 0 -> transposeRatio == 1.0 exactly,
     // and the engine skips its resample-for-transpose step entirely at
     // 0 semitones (StretchEngine.cpp), so this filter call with a fixed
-    // ratio of 1.0 is exactly what the engine itself runs.
+    // ratio of 1.0 is exactly what the engine itself runs. The record
+    // path is the engine's own call too -- applyRecordPath, not a bare
+    // quantise, since the input anti-alias filter is always in circuit
+    // even at effectiveRateHz == hostSampleRateHz (RateModel.h).
     std::vector<float> reference = source;
-    akz::quantizeBuffer(reference.data(), reference.size(), 16); // S1000 bit depth
+    akz::applyRecordPath(reference.data(), reference.size(), AkzMachine_S1000, 44100.0, 44100.0);
     akz::applyFilter(reference.data(), reference.size(), AkzMachine_S1000, params.filterCutoff01, params.filterResonance01, 44100.0, 1.0);
 
     AKZ_CHECK_EQ(actual.size(), reference.size());

@@ -63,7 +63,10 @@ RealtimeChannel::MachineChain::MachineChain(AkzMachine m, double hostRate)
 
 void RealtimeChannel::MachineChain::configureRate(float requestedSampleRateHz, double hostRate) {
     effectiveRateHz = resolveSampleRateHz(machine, requestedSampleRateHz, hostRate);
-    rateStageActive = effectiveRateHz < hostRate;
+    // Holds are identity at effectiveRateHz >= hostRate (see .h) -- the
+    // gate is an optimisation, not a bypass. The AA filter is retuned
+    // either way: it is always in circuit.
+    holdStagesActive = effectiveRateHz < hostRate;
     aaFilter.retune(effectiveRateHz * profile.aaFilterCutoffRatio);
     recordHold.configure(effectiveRateHz, hostRate);
     dacHold.configure(effectiveRateHz, hostRate);
@@ -81,20 +84,28 @@ void RealtimeChannel::MachineChain::retuneFilter(double cutoffHz, int resonanceC
 }
 
 void RealtimeChannel::MachineChain::processBlock(float* buf, size_t count, int bitDepthOverride) {
-    if (rateStageActive) {
-        for (size_t i = 0; i < count; ++i) {
-            buf[i] = aaFilter.process(buf[i]);
-        }
+    // The machine's ADC front end is always in circuit -- the input
+    // anti-alias filter runs at every effective rate, including rates
+    // at or above the host's (a machine re-clocking a host-rate stream
+    // still hears its own input filter; only the decimate/hold stages
+    // collapse to identity there). Matches applyRecordPath.
+    for (size_t i = 0; i < count; ++i) {
+        buf[i] = aaFilter.process(buf[i]);
+    }
+    if (holdStagesActive) {
         recordHold.process(buf, count);
     }
 
     ConverterSpec spec = converterSpecForMachine(profile);
     if (bitDepthOverride > 0) {
-        spec.bits = bitDepthOverride;
+        // Capped at native: the override is a crusher, not an upgrade
+        // -- a request above the machine's own depth resolves to the
+        // machine's own depth, never cleaner than it.
+        spec.bits = std::min(bitDepthOverride, profile.bitDepth);
     }
     quantizeBuffer(buf, count, spec);
 
-    if (rateStageActive) {
+    if (holdStagesActive) {
         dacHold.process(buf, count);
     }
 
@@ -127,11 +138,20 @@ RealtimeChannel::RealtimeChannel(double hostSampleRateHz, size_t maxBlockFrames)
     (void)maxBlockFrames;
     _crossfadeLength = crossfadeLengthFor(hostSampleRateHz);
     _crossfadeScratch.assign(kControlIntervalFrames, 0.0f);
+
+    // Every machine's chain, built HERE (the host's prepareToPlay
+    // thread), never inside process() -- see .h.
+    _chains.reserve(static_cast<size_t>(AkzMachine_Count));
+    for (int i = 0; i < static_cast<int>(AkzMachine_Count); ++i) {
+        _chains.push_back(std::make_unique<MachineChain>(static_cast<AkzMachine>(i), hostSampleRateHz));
+    }
+
     _current.machine = AkzMachine_S950;
     _current.bitDepth = 0;
     _current.sampleRateHz = 0.0f;
     _current.filterCutoff01 = 1.0f;
     _current.filterResonance01 = 0.0f;
+    _chain = _chains[static_cast<size_t>(_current.machine)].get();
     _smoothedCutoff01 = _current.filterCutoff01;
     _smoothedResonance01 = _current.filterResonance01;
 }
@@ -151,7 +171,7 @@ void RealtimeChannel::_applyPendingParamsIfAny() {
         _current = _pendingParams;
         _hasPendingParams = false;
         if (_current.machine != oldMachine) {
-            _needsRebuild = true;
+            _machineSwapPending = true;
         }
     }
     _paramsMutex.unlock();
@@ -159,7 +179,7 @@ void RealtimeChannel::_applyPendingParamsIfAny() {
 
 void RealtimeChannel::reset() {
     if (_chain) _chain->reset();
-    if (_crossfadeFrom) _crossfadeFrom.reset(); // drop mid-crossfade state rather than resume a stale fade after a transport jump
+    _crossfadeFrom = nullptr; // drop mid-crossfade state rather than resume a stale fade after a transport jump
     _crossfadeRemaining = 0;
     _smoothedCutoff01 = _current.filterCutoff01;
     _smoothedResonance01 = _current.filterResonance01;
@@ -168,14 +188,19 @@ void RealtimeChannel::reset() {
 void RealtimeChannel::process(float* inout, size_t frames) {
     _applyPendingParamsIfAny();
 
-    if (_needsRebuild) {
-        auto newChain = std::make_unique<MachineChain>(_current.machine, _hostSampleRateHz);
-        if (_chain) {
-            _crossfadeFrom = std::move(_chain);
+    if (_machineSwapPending) {
+        // Pointer swap into the pre-built array -- no allocation. The
+        // incoming chain is reset() so it starts from the same zeroed
+        // state a freshly built chain used to have (idle chains may
+        // hold stale state from an earlier activation).
+        MachineChain* incoming = _chains[static_cast<size_t>(_current.machine)].get();
+        incoming->reset();
+        if (_chain && _chain != incoming) {
+            _crossfadeFrom = _chain;
             _crossfadeRemaining = _crossfadeLength;
         }
-        _chain = std::move(newChain);
-        _needsRebuild = false;
+        _chain = incoming;
+        _machineSwapPending = false;
     }
 
     const double smoothingCoeff = smoothingCoefficientFor(_hostSampleRateHz);
@@ -219,7 +244,7 @@ void RealtimeChannel::process(float* inout, size_t frames) {
 
             _crossfadeRemaining -= chunk;
             if (_crossfadeRemaining == 0) {
-                _crossfadeFrom.reset();
+                _crossfadeFrom = nullptr;
             }
         } else {
             _chain->processBlock(segment, chunk, _current.bitDepth);

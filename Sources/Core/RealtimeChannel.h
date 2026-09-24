@@ -78,8 +78,8 @@ private:
     // decimate/hold -> quantise -> DAC hold -> filter. Everything here
     // is per-machine-profile-shaped (topology, stage count, pole count,
     // companding), which is exactly what makes a MACHINE change --
-    // unlike a cutoff/resonance/bandwidth/bit-depth move -- need a new
-    // one of these rather than an in-place retune.
+    // unlike a cutoff/resonance/bandwidth/bit-depth move -- swap to a
+    // different pre-built one of these rather than an in-place retune.
     struct MachineChain {
         MachineChain(AkzMachine machine, double hostSampleRateHz);
 
@@ -97,7 +97,9 @@ private:
 
         // Runs the whole chain over `count` in-place samples.
         // bitDepthOverride <= 0 means "use the machine's own native
-        // bit depth."
+        // bit depth"; a positive value is capped AT that native depth
+        // (the override can only crush further, never clean the machine
+        // up past its own converter).
         void processBlock(float* buf, size_t count, int bitDepthOverride);
 
         void reset();
@@ -106,7 +108,14 @@ private:
         const AkzMachineProfile& profile;
         const double hostSampleRateHz;
         double effectiveRateHz = 0.0;
-        bool rateStageActive = false;
+
+        // Gates ONLY the two hold stages (record decimate + DAC hold),
+        // which are mathematical identity at effectiveRateHz >=
+        // hostSampleRateHz (every host sample is captured when
+        // samplesPerTarget < 1). The AA filter is NOT gated by this --
+        // it is the machine's always-on input front end and runs at
+        // every rate, matching applyRecordPath's behaviour.
+        bool holdStagesActive = false;
 
         OnePoleLPF aaFilter;
         StreamingHold recordHold;
@@ -120,7 +129,14 @@ private:
 
     // Audio-thread-owned; never touched from any other thread.
     AkzRealtimeChannelParams _current{};
-    std::unique_ptr<MachineChain> _chain;
+
+    // Every machine's chain, built once at construction (i.e. in the
+    // host's prepareToPlay, NOT on the render thread) so a machine swap
+    // is a pointer exchange plus a reset() of the incoming chain --
+    // process() never allocates, restoring the contract the earlier
+    // make_unique-in-process() version violated. Indexed by AkzMachine.
+    std::vector<std::unique_ptr<MachineChain>> _chains;
+    MachineChain* _chain = nullptr;         // into _chains, never owned
 
     // Non-null only while crossfading a just-started machine change's
     // new chain in over the outgoing one -- see .cpp for why a machine
@@ -128,11 +144,11 @@ private:
     // pole count and the filter's topology/stage count are per-machine-
     // profile constants, not something an existing chain's stages can
     // just be retuned to.
-    std::unique_ptr<MachineChain> _crossfadeFrom;
+    MachineChain* _crossfadeFrom = nullptr; // into _chains, never owned
     size_t _crossfadeRemaining = 0;
     size_t _crossfadeLength = 0;
     std::vector<float> _crossfadeScratch; // fixed kControlIntervalFrames size, never reallocated in process()
-    bool _needsRebuild = true; // forces the very first process() call to construct _chain
+    bool _machineSwapPending = false; // set when pending params carry a different machine than _current
 
     // Control-rate cutoff/resonance smoothing -- see .cpp for the
     // per-sample one-pole smoother and the retune cadence.

@@ -52,6 +52,17 @@ double resolveSampleRateHz(AkzMachine machine, float requestedSampleRateHz, doub
         return profile.maxSampleRateHz; // machine's own top-end rate -- never a bypass
     }
     const double requested = static_cast<double>(requestedSampleRateHz);
+    if (!profile.hasVariableSampleRate && profile.minSampleRateHz < profile.maxSampleRateHz) {
+        // A dual-FIXED-rate machine (S1000/S2000/S3000/S3200) has
+        // exactly two real rates -- min and max are a switch, not the
+        // ends of a continuous range. Snap any request to the nearer
+        // bound so a mid-range value can't produce a rate the hardware
+        // never had (the old plain clamp admitted them, a known
+        // simplification flagged in AkaizerCore.h).
+        return (requested - profile.minSampleRateHz) < (profile.maxSampleRateHz - requested)
+            ? profile.minSampleRateHz
+            : profile.maxSampleRateHz;
+    }
     return std::max(profile.minSampleRateHz, std::min(requested, profile.maxSampleRateHz));
 }
 
@@ -62,11 +73,11 @@ void applyRecordPath(float* buffer, size_t count, AkzMachine machine, double eff
 
     const ConverterSpec converterSpec = converterSpecForMachine(profile);
 
-    if (effectiveRateHz <= 0.0 || effectiveRateHz >= hostSampleRateHz) {
-        // Already at (or above) host rate -- nothing to decimate, and no
-        // anti-alias filtering either: a machine running at its own
-        // native/host rate should sound identical to before this stage
-        // existed, not pick up an incidental low-pass "for free."
+    if (effectiveRateHz <= 0.0) {
+        // Degenerate input (unreachable via resolveSampleRateHz, which
+        // always returns a real in-range rate) -- quantise only, since
+        // no meaningful AA cutoff can be computed from a non-positive
+        // rate.
         quantizeBuffer(buffer, count, converterSpec);
         return;
     }
@@ -74,7 +85,11 @@ void applyRecordPath(float* buffer, size_t count, AkzMachine machine, double eff
     // Anti-alias filter, tracking the TARGET rate rather than a fixed
     // cutoff -- see RateModel.h and AkaizerCore.h's aaFilterCutoffRatio
     // doc comment. Runs at hostSampleRateHz since that's still the rate
-    // `buffer` is sampled at going into this stage.
+    // `buffer` is sampled at going into this stage. ALWAYS in circuit,
+    // including at effectiveRateHz >= hostSampleRateHz: this is the
+    // machine's input front end, not a decimation-only side effect --
+    // a machine re-clocking a host-rate stream still hears its own
+    // input filter (RealTimeChannel's MachineChain does the same).
     const double aaCutoffHz = effectiveRateHz * profile.aaFilterCutoffRatio;
     {
         OnePoleLPF aa(profile.aaFilterPoles, aaCutoffHz, hostSampleRateHz);
@@ -85,8 +100,13 @@ void applyRecordPath(float* buffer, size_t count, AkzMachine machine, double eff
 
     // True decimation to effectiveRateHz followed by zero-order-hold
     // reconstruction back to hostSampleRateHz -- see holdAtRate's own
-    // comment for why this is length-neutral by construction.
-    holdAtRate(buffer, count, effectiveRateHz, hostSampleRateHz);
+    // comment for why this is length-neutral by construction. Skipped
+    // at effectiveRateHz >= hostSampleRateHz, where the hold is
+    // mathematical identity (every host sample is captured when
+    // samplesPerTarget < 1) -- an optimisation, not a bypass.
+    if (effectiveRateHz < hostSampleRateHz) {
+        holdAtRate(buffer, count, effectiveRateHz, hostSampleRateHz);
+    }
 
     // Bit-depth (and, if the machine compands, companding) quantise the
     // now rate-limited signal last -- sample rate and converter

@@ -53,19 +53,22 @@ namespace akz {
 // their defining character. There is no bypass value left: this function
 // always resolves to a real, in-range rate. A positive value is clamped
 // into [profile.minSampleRateHz, profile.maxSampleRateHz] so a caller
-// never has to already know the machine's own range, and a fixed/dual-
-// rate machine (hasVariableSampleRate == 0) collapses any request
-// outside its two real rates to the nearer bound automatically, since
-// clamping into [min, max] does that by construction.
+// never has to already know the machine's own range -- and on a
+// dual-FIXED-rate machine (hasVariableSampleRate == 0 with min < max:
+// S1000/S2000/S3000/S3200) it additionally snaps to the nearer bound,
+// since those two rates are a switch, not the ends of a continuous
+// range the hardware could actually produce.
 double resolveSampleRateHz(AkzMachine machine, float requestedSampleRateHz, double hostSampleRateHz);
 
-// Applies the record path to `buffer` in place: anti-alias filter (only
-// when effectiveRateHz < hostSampleRateHz -- skipped entirely otherwise,
-// so a machine already running at its own native/host rate sees no
-// filtering at all, not even a negligible one) -> decimate+reconstruct
-// -> bit-depth quantise. Always exactly `count` frames in, `count`
-// frames out. A no-op beyond quantisation when effectiveRateHz >=
-// hostSampleRateHz (nothing to decimate).
+// Applies the record path to `buffer` in place: anti-alias filter ->
+// decimate+reconstruct -> bit-depth quantise. Always exactly `count`
+// frames in, `count` frames out. The anti-alias filter is ALWAYS in
+// circuit -- it is the machine's input front end, not a decimation
+// side effect, so a machine re-clocking a host-rate stream
+// (effectiveRateHz >= hostSampleRateHz) still hears its own input
+// filter. Only the decimate+reconstruct hold is skipped there, where
+// it is mathematical identity. RealtimeChannel's MachineChain mirrors
+// this exactly.
 void applyRecordPath(float* buffer, size_t count, AkzMachine machine, double effectiveRateHz, double hostSampleRateHz);
 
 // Applies the DAC back end to `buffer` in place: zero-order-hold at

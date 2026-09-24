@@ -5,6 +5,8 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
+#include <cmath>
+
 namespace {
 
 constexpr const char* kMachineParamId = "machine";
@@ -62,35 +64,60 @@ juce::AudioProcessorValueTreeState::ParameterLayout PatinaFXAudioProcessor::_cre
         kMachineParamId, "Machine", machineChoices(), static_cast<int>(AkzMachine_S950)));
 
     // 0 = machine's own native bit depth -- see AkaizerCore.h's
-    // AkzRealtimeChannelParams.bitDepth doc.
+    // AkzRealtimeChannelParams.bitDepth doc. The core caps any positive
+    // override AT native (crusher-only), so values above the selected
+    // machine's depth are legal but resolve to native.
     layout.add(std::make_unique<juce::AudioParameterInt>(
-        kBitDepthParamId, "Bit Depth", 0, 24, 0));
+        kBitDepthParamId, "Bit Depth", 0, 24, 0,
+        juce::AudioParameterIntAttributes().withStringFromValueFunction(
+            [](int value, int) {
+                return value <= 0 ? juce::String("Native")
+                                  : juce::String(value) + " bit";
+            })));
 
     // Absolute Hz, deliberately NOT scoped to any one machine's own
     // [min,max] -- akz_realtime_channel_process resolves/clamps this
     // into whichever machine is currently selected (RateModel.h's
     // resolveSampleRateHz), so one fixed control range works for every
     // machine without the parameter itself needing to change shape when
-    // the machine does. A no-op on a fixed-rate machine (see
-    // MachineControls.h's machineHasBandwidthControl -- the editor
-    // hides this control there, but leaving the parameter live and
-    // harmless is simpler than disabling automation on it).
+    // the machine does. The 7000 Hz floor sits just below the lowest
+    // machine minimum (Fairlight's 7040) so there's no dead travel
+    // under every machine's clamp; the 48000 default resolves to each
+    // machine's own maxSampleRateHz, matching the app's
+    // akz_stretch_params_default convention. On a dual-fixed-rate
+    // machine (S1000/S2000/S3000/S3200) the resolve step snaps to the
+    // nearer of its two real rates -- see MachineControls.h's
+    // machineHasBandwidthControl for why the knob shows there.
     layout.add(std::make_unique<juce::AudioParameterFloat>(
         kBandwidthParamId, "Bandwidth",
-        juce::NormalisableRange<float>(1000.0f, 48000.0f, 1.0f, 0.35f), // skewed so the musically dense low end isn't cramped
-        44100.0f));
+        juce::NormalisableRange<float>(7000.0f, 48000.0f, 1.0f, 0.35f), // skewed so the musically dense low end isn't cramped
+        48000.0f,
+        juce::AudioParameterFloatAttributes().withStringFromValueFunction(
+            [](float value, int) { return juce::String(static_cast<int>(std::lround(value))) + " Hz"; })));
+
+    // 0..1 knobs: two decimals, matching the app's own "%.2f" knob
+    // convention (MachineControls.swift) rather than JUCE's default
+    // three-plus-decimal display.
+    const auto twoDecimals = juce::AudioParameterFloatAttributes().withStringFromValueFunction(
+        [](float value, int) { return juce::String(value, 2); });
 
     layout.add(std::make_unique<juce::AudioParameterFloat>(
-        kCutoffParamId, "Cutoff", juce::NormalisableRange<float>(0.0f, 1.0f), 1.0f));
+        kCutoffParamId, "Cutoff", juce::NormalisableRange<float>(0.0f, 1.0f), 1.0f,
+        twoDecimals));
 
     layout.add(std::make_unique<juce::AudioParameterFloat>(
-        kResonanceParamId, "Resonance", juce::NormalisableRange<float>(0.0f, 1.0f), 0.0f));
+        kResonanceParamId, "Resonance", juce::NormalisableRange<float>(0.0f, 1.0f), 0.0f,
+        twoDecimals));
 
     layout.add(std::make_unique<juce::AudioParameterFloat>(
-        kMixParamId, "Mix", juce::NormalisableRange<float>(0.0f, 1.0f), 1.0f));
+        kMixParamId, "Mix", juce::NormalisableRange<float>(0.0f, 1.0f), 1.0f,
+        juce::AudioParameterFloatAttributes().withStringFromValueFunction(
+            [](float value, int) { return juce::String(static_cast<int>(std::lround(value * 100.0f))) + " %"; })));
 
     layout.add(std::make_unique<juce::AudioParameterFloat>(
-        kOutputParamId, "Output", juce::NormalisableRange<float>(-24.0f, 24.0f), 0.0f));
+        kOutputParamId, "Output", juce::NormalisableRange<float>(-24.0f, 24.0f), 0.0f,
+        juce::AudioParameterFloatAttributes().withStringFromValueFunction(
+            [](float value, int) { return juce::String(value, 1) + " dB"; })));
 
     return layout;
 }

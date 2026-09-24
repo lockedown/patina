@@ -16,10 +16,12 @@
 
 namespace patinafx {
 
-// Bandwidth only means anything on a machine whose sample rate is a
-// live control, not a fixed spec (S900/S950 today) -- same
-// hasVariableSampleRate scoping as MachineControls.swift's Bandwidth
-// descriptor.
+// Bandwidth means something on any machine whose sample rate is a
+// selectable spec, not a single fixed value -- continuously variable
+// machines (S900/S950, Fairlight, Mirage) get a live knob, and
+// dual-fixed-rate machines (S1000/S2000/S3000/S3200) get the same knob
+// snapping between their two real rates via resolveSampleRateHz. Only
+// genuinely single-rate machines (SP-1200, Emulator II) hide it.
 bool machineHasBandwidthControl(AkzMachine machine);
 
 // Resonance only does anything on machines whose filter actually has
